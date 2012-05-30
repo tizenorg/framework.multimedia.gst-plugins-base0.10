@@ -6,6 +6,7 @@ Group:      Applications/Multimedia
 License:    LGPLv2+
 URL:        http://gstreamer.freedesktop.org/
 Source0:    http://gstreamer.freedesktop.org/src/gst-plugins-base/%{name}-%{version}.tar.gz
+Source1001: packaging/gst-plugins-base.manifest 
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
 BuildRequires:  pkgconfig(ogg)
@@ -50,6 +51,7 @@ Separate sub-package contaning helper applications of gstreamer base plugins.
 
 
 %build
+cp %{SOURCE1001} .
 export CFLAGS+=" -DGST_EXT_TEXTRENDER_ENHANCEMENT  -DGST_EXT_XV_ENHANCEMENT"
 %autogen --noconfigure
 %configure \
@@ -86,6 +88,7 @@ rm -rf %{buildroot}/tmp/dump
 
 
 %files
+%manifest gst-plugins-base.manifest
 %{_libdir}/libgstinterfaces-0.10.so.*
 %{_libdir}/libgstaudio-0.10.so.*
 %{_libdir}/libgstcdda-0.10.so.*
@@ -128,6 +131,7 @@ rm -rf %{buildroot}/tmp/dump
 
 
 %files devel
+%manifest gst-plugins-base.manifest
 %defattr(-,root,root,-)
 %dir %{_includedir}/gstreamer-0.10/gst/app
 /usr/include/gstreamer-0.10/gst/tag/xmpwriter.h
@@ -232,6 +236,7 @@ rm -rf %{buildroot}/tmp/dump
 %{_libdir}/pkgconfig/*.pc
 
 %files tools
+%manifest gst-plugins-base.manifest
 %defattr(-,root,root,-)
 # helper programs
 %{_bindir}/gst-visualise-0.10

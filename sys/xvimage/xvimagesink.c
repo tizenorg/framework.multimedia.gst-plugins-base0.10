@@ -1196,15 +1196,19 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
 
     if (atom == None) {
       atom = XInternAtom( xvimagesink->xcontext->disp, 
-        "_USER_WM_PORT_ATTRIBUTE_ROTATION", False );
+        "_USER_WM_PORT_ATTRIBUTE_ROTATION", True);
     }
 
-    ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom, rotate );
-    if (ret != Success) {
-      GST_ERROR_OBJECT( xvimagesink, "XvSetPortAttribute failed[%d]. disp[%x],xv_port_id[%d],atom[%x],rotate[%d]",
-        ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom, rotate );
-      return FALSE;
+    if (atom != None) {
+	ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom, rotate );
+
+	if (ret != Success) {
+	  GST_ERROR_OBJECT( xvimagesink, "XvSetPortAttribute failed[%d]. disp[%x],xv_port_id[%d],atom[%x],rotate[%d]",
+	    ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom, rotate );
+	  return FALSE;
+	}
     }
+
 
     /* src input indicates the status when degree is 0 */
     /* dst input indicates the area that src will be shown regardless of rotate */
@@ -1847,8 +1851,8 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
 #ifdef GST_EXT_XV_ENHANCEMENT
         GST_INFO_OBJECT( xvimagesink, "message type : %d", e.xclient.message_type );
 
-        active_win_atom   = XInternAtom (xvimagesink->xcontext->disp, "_X_ILLUME_ACTIVATE_WINDOW", False);
-        deactive_win_atom = XInternAtom (xvimagesink->xcontext->disp, "_X_ILLUME_DEACTIVATE_WINDOW", False);
+        active_win_atom   = XInternAtom (xvimagesink->xcontext->disp, "_X_ILLUME_ACTIVATE_WINDOW", True);
+        deactive_win_atom = XInternAtom (xvimagesink->xcontext->disp, "_X_ILLUME_DEACTIVATE_WINDOW", True);
 
         if( !active_win_atom || !deactive_win_atom )
         {
@@ -1870,7 +1874,7 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
 
               xvimagesink->is_hided = TRUE;
               atom_stream = XInternAtom( xvimagesink->xcontext->disp,
-                                              "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", False );
+                                              "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", True );
               if( atom_stream != None )
               {
                 if( XvSetPortAttribute( xvimagesink->xcontext->disp,
@@ -2870,6 +2874,11 @@ gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
   GstXContext *xcontext = NULL;
 #ifdef GST_EXT_XV_ENHANCEMENT
   Atom atom_preemption = None;
+  gboolean has_attr_preemption = FALSE;
+
+  int count, i;
+  XvAttribute *xv_attr = NULL;
+  static const char attr_preemption[] = "_USER_WM_PORT_ATTRIBUTE_PREEMPTION";
 #endif
 
   xvimagesink = GST_XVIMAGESINK (element);
@@ -2907,10 +2916,22 @@ gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
 #ifdef GST_EXT_XV_ENHANCEMENT
+      xv_attr=XvQueryPortAttributes (xvimagesink->xcontext->disp,
+          xvimagesink->xcontext->xv_port_id, &count);
+
+      GST_DEBUG_OBJECT (xvimagesink, "Checking %d Xv port attributes", count);
+
+      for (i = 0; i < count ; i++){
+        if (!strcmp (xv_attr[i].name, attr_preemption)) {
+		has_attr_preemption = TRUE;
+		break;
+         }
+      }
+
       g_mutex_lock (xvimagesink->x_lock);
       atom_preemption = XInternAtom( xvimagesink->xcontext->disp,
                                      "_USER_WM_PORT_ATTRIBUTE_PREEMPTION", False );
-      if(atom_preemption != None)
+      if(atom_preemption != None && has_attr_preemption)
       {
          if( XvSetPortAttribute( xvimagesink->xcontext->disp,
                                  xvimagesink->xcontext->xv_port_id,
@@ -2937,11 +2958,23 @@ gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
   switch (transition) {
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
 #ifdef GST_EXT_XV_ENHANCEMENT
+      xv_attr=XvQueryPortAttributes (xvimagesink->xcontext->disp,
+          xvimagesink->xcontext->xv_port_id, &count);
+
+      GST_DEBUG_OBJECT (xvimagesink, "Checking %d Xv port attributes", count);
+
+      for (i = 0; i < count ; i++){
+        if (!strcmp (xv_attr[i].name, attr_preemption)) {
+		has_attr_preemption = TRUE;
+		break;
+         }
+      }
+
       xvimagesink->rotate_changed = TRUE;
       g_mutex_lock (xvimagesink->x_lock);
       atom_preemption = XInternAtom( xvimagesink->xcontext->disp,
-                                     "_USER_WM_PORT_ATTRIBUTE_PREEMPTION", False );
-      if(atom_preemption != None)
+                                     "_USER_WM_PORT_ATTRIBUTE_PREEMPTION", True );
+      if(atom_preemption != None && has_attr_preemption)
       {
          if( XvSetPortAttribute( xvimagesink->xcontext->disp,
                                  xvimagesink->xcontext->xv_port_id,
@@ -4057,7 +4090,7 @@ gst_xvimagesink_set_property (GObject * object, guint prop_id,
       if( xvimagesink->visible && ( g_value_get_boolean( value ) == FALSE ) )
       {
         Atom atom_stream = XInternAtom( xvimagesink->xcontext->disp,
-                                        "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", False );
+                                        "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", True );
         if( atom_stream != None )
         {
           if( XvSetPortAttribute( xvimagesink->xcontext->disp,

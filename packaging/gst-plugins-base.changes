@@ -1,0 +1,4 @@
+* Fri June 08 2012 Yan Yin <yan.yin@intel.com> - 0.10.34
+- check attrs before set it
+- tigger submission to OBS
+

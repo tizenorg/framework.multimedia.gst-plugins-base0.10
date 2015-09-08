@@ -1438,7 +1438,8 @@ gst_base_audio_sink_sync_latency (GstBaseSink * bsink, GstMiniObject * obj)
   }
 
   /* start ringbuffer so we can start slaving right away when we need to */
-  gst_ring_buffer_start (sink->ringbuffer);
+  if (sink->priv->slave_method != GST_BASE_AUDIO_SINK_SLAVE_NONE)
+    gst_ring_buffer_start (sink->ringbuffer);
 
   GST_DEBUG_OBJECT (sink,
       "internal time: %" GST_TIME_FORMAT " external time: %" GST_TIME_FORMAT,

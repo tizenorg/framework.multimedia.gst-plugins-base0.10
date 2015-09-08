@@ -796,7 +796,7 @@ gst_ogg_demux_collect_sync_time (GstOggDemux * ogg, GstOggChain * chain)
 
 /* submit a packet to the oggpad, this function will run the
  * typefind code for the pad if this is the first packet for this
- * stream 
+ * stream
  */
 static GstFlowReturn
 gst_ogg_pad_submit_packet (GstOggPad * pad, ogg_packet * packet)
@@ -1049,7 +1049,7 @@ gst_ogg_pad_submit_packet (GstOggPad * pad, ogg_packet * packet)
   return ret;
 }
 
-/* flush at most @npackets from the stream layer. All packets if 
+/* flush at most @npackets from the stream layer. All packets if
  * @npackets is 0;
  */
 static GstFlowReturn
@@ -2337,7 +2337,7 @@ boundary_reached:
 }
 
 /* from the current offset, find the previous page, seeking backwards
- * until we find the page. 
+ * until we find the page.
  */
 static GstFlowReturn
 gst_ogg_demux_get_prev_page (GstOggDemux * ogg, ogg_page * og, gint64 * offset)
@@ -2440,7 +2440,7 @@ gst_ogg_demux_deactivate_current_chain (GstOggDemux * ogg)
     pad->added = FALSE;
   }
 
-  /* if we cannot seek back to the chain, we can destroy the chain 
+  /* if we cannot seek back to the chain, we can destroy the chain
    * completely */
   if (!ogg->pullmode) {
     gst_ogg_chain_free (chain);
@@ -2617,7 +2617,7 @@ gst_ogg_demux_activate_chain (GstOggDemux * ogg, GstOggChain * chain,
 static gboolean
 do_binary_search (GstOggDemux * ogg, GstOggChain * chain, gint64 begin,
     gint64 end, gint64 begintime, gint64 endtime, gint64 target,
-    gint64 * offset)
+    gint64 * offset, gboolean only_serial_no, gint serialno)
 {
   gint64 best;
   GstFlowReturn ret;
@@ -2690,6 +2690,11 @@ do_binary_search (GstOggDemux * ogg, GstOggChain * chain, gint64 begin,
           GST_LOG_OBJECT (ogg, "granulepos of next page is -1");
           continue;
         }
+
+        /* Avoid seeking to an incorrect granuletime by only considering
+           the stream for which we found the earliest time */
+        if (only_serial_no && ogg_page_serialno (&og) != serialno)
+          continue;
 
         /* get the stream */
         pad = gst_ogg_chain_get_stream (chain, ogg_page_serialno (&og));
@@ -2808,8 +2813,8 @@ gst_ogg_demux_do_seek (GstOggDemux * ogg, GstSegment * segment,
   gint64 total;
   gint64 result = 0;
   GstFlowReturn ret;
-  gint i, pending, len;
-  gboolean first_parsed_page = TRUE;
+  gint i, pending;
+  gint serialno = 0;
 
   position = segment->last_stop;
 
@@ -2833,14 +2838,14 @@ gst_ogg_demux_do_seek (GstOggDemux * ogg, GstSegment * segment,
   target = position - total + begintime;
 
   if (!do_binary_search (ogg, chain, begin, end, begintime, endtime, target,
-          &best))
+          &best, FALSE, 0))
     goto seek_error;
 
   /* second step: find pages for all streams, we use the keyframe_granule to keep
    * track of which ones we saw. If we have seen a page for each stream we can
    * calculate the positions of each keyframe. */
   GST_DEBUG_OBJECT (ogg, "find keyframes");
-  len = pending = chain->streams->len;
+  pending = chain->streams->len;
 
   /* figure out where the keyframes are */
   keytarget = target;
@@ -2873,32 +2878,6 @@ gst_ogg_demux_do_seek (GstOggDemux * ogg, GstSegment * segment,
       GST_LOG_OBJECT (ogg, "granulepos of next page is -1");
       continue;
     }
-
-    /* we only do this the first time we pass here */
-    if (first_parsed_page) {
-      /* Now that we have a time reference from the page, we can check
-       * whether all streams still have pages from here on.
-       *
-       * This would be more elegant before the loop, but getting the page from
-       * there without breaking anything would be more costly */
-      granule_time = gst_ogg_stream_get_end_time_for_granulepos (&pad->map,
-          granulepos);
-      for (i = 0; i < len; i++) {
-        GstOggPad *stream = g_array_index (chain->streams, GstOggPad *, i);
-
-        if (stream == pad)
-          /* we already know we have at least one page (the current one)
-           * for this stream */
-          continue;
-
-        if (granule_time > stream->map.total_time)
-          /* we won't encounter any more pages of this stream, so we don't
-           * try finding a key frame for it */
-          pending--;
-      }
-      first_parsed_page = FALSE;
-    }
-
 
     /* in reverse we want to go past the page with the lower timestamp */
     if (segment->rate < 0.0) {
@@ -2934,8 +2913,10 @@ gst_ogg_demux_do_seek (GstOggDemux * ogg, GstSegment * segment,
     /* collect smallest value */
     if (keyframe_time != -1) {
       keyframe_time += begintime;
-      if (keyframe_time < keytarget)
+      if (keyframe_time < keytarget) {
+        serialno = pad->map.serialno;
         keytarget = keyframe_time;
+      }
     }
 
   next:
@@ -2954,7 +2935,7 @@ gst_ogg_demux_do_seek (GstOggDemux * ogg, GstSegment * segment,
 
     /* last step, seek to the location of the keyframe */
     if (!do_binary_search (ogg, chain, begin, end, begintime, endtime,
-            keytarget, &best))
+            keytarget, &best, TRUE, serialno))
       goto seek_error;
   } else {
     /* seek back to previous position */
@@ -3208,7 +3189,7 @@ gst_ogg_demux_perform_seek_pull (GstOggDemux * ogg, GstEvent * event)
 
     ogg->segment_running = TRUE;
     ogg->seqnum = seqnum;
-    /* restart our task since it might have been stopped when we did the 
+    /* restart our task since it might have been stopped when we did the
      * flush. */
     gst_pad_start_task (ogg->sinkpad, (GstTaskFunction) gst_ogg_demux_loop,
         ogg->sinkpad);
@@ -3245,8 +3226,12 @@ gst_ogg_demux_get_duration_push (GstOggDemux * ogg, int flags)
      granpos there, but it's fairly likely */
   position =
       ogg->push_byte_length - DURATION_CHUNK_OFFSET - EOS_AVOIDANCE_THRESHOLD;
-  if (position < 0)
-    position = 0;
+  if (position < 0) {
+    if (ogg->push_byte_length > EOS_AVOIDANCE_THRESHOLD)
+      position = ogg->push_byte_length - (EOS_AVOIDANCE_THRESHOLD / 2);
+   else
+      position = 0;
+  }
 
   GST_DEBUG_OBJECT (ogg,
       "Getting duration, seeking near the end, to %" G_GINT64_FORMAT, position);
@@ -3578,9 +3563,9 @@ done:
 }
 
 /* read a chain from the ogg file. This code will
- * read all BOS pages and will create and return a GstOggChain 
- * structure with the results. 
- * 
+ * read all BOS pages and will create and return a GstOggChain
+ * structure with the results.
+ *
  * This function will also read N pages from each stream in the
  * chain and submit them to the decoders. When the decoder has
  * decoded the first buffer, we know the timestamp of the first

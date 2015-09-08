@@ -33,7 +33,7 @@ G_BEGIN_DECLS
  * @GST_VIDEO_FORMAT_I420: planar 4:2:0 YUV
  * @GST_VIDEO_FORMAT_YV12: planar 4:2:0 YVU (like I420 but UV planes swapped)
  * @GST_VIDEO_FORMAT_YUY2: packed 4:2:2 YUV (Y0-U0-Y1-V0 Y2-U2-Y3-V2 Y4 ...)
- * @GST_VIDEO_FORMAT_UYVY: packed 4:2:2 YUV (U0-Y0-V0-Y1 U2-Y2-V2-Y3 U4 ...) 
+ * @GST_VIDEO_FORMAT_UYVY: packed 4:2:2 YUV (U0-Y0-V0-Y1 U2-Y2-V2-Y3 U4 ...)
  * @GST_VIDEO_FORMAT_AYUV: packed 4:4:4 YUV with alpha channel (A0-Y0-U0-V0 ...)
  * @GST_VIDEO_FORMAT_RGBx: sparse rgb packed into 32 bit, space last
  * @GST_VIDEO_FORMAT_BGRx: sparse reverse rgb packed into 32 bit, space last
@@ -119,6 +119,14 @@ typedef enum {
   GST_VIDEO_FORMAT_ARGB64,
   GST_VIDEO_FORMAT_AYUV64,
   GST_VIDEO_FORMAT_r210
+#ifdef GST_EXT_XV_ENHANCEMENT
+, GST_VIDEO_FORMAT_ST12,
+  GST_VIDEO_FORMAT_SN12,
+  GST_VIDEO_FORMAT_SUYV,
+  GST_VIDEO_FORMAT_SUY2,
+  GST_VIDEO_FORMAT_S420,
+  GST_VIDEO_FORMAT_SYVY
+#endif
 } GstVideoFormat;
 
 #define GST_VIDEO_BYTE1_MASK_32  "0xFF000000"
@@ -264,13 +272,13 @@ typedef enum {
 
 #define GST_VIDEO_CAPS_RGBx \
     __GST_VIDEO_CAPS_MAKE_32 (1, 2, 3)
-  
+
 #define GST_VIDEO_CAPS_xRGB \
     __GST_VIDEO_CAPS_MAKE_32 (2, 3, 4)
-  
+
 #define GST_VIDEO_CAPS_BGRx \
     __GST_VIDEO_CAPS_MAKE_32 (3, 2, 1)
-  
+
 #define GST_VIDEO_CAPS_xBGR \
     __GST_VIDEO_CAPS_MAKE_32 (4, 3, 2)
 
@@ -278,13 +286,13 @@ typedef enum {
 
 #define GST_VIDEO_CAPS_RGBA \
     __GST_VIDEO_CAPS_MAKE_32A (1, 2, 3, 4)
-  
+
 #define GST_VIDEO_CAPS_ARGB \
     __GST_VIDEO_CAPS_MAKE_32A (2, 3, 4, 1)
-  
+
 #define GST_VIDEO_CAPS_BGRA \
     __GST_VIDEO_CAPS_MAKE_32A (3, 2, 1, 4)
-  
+
 #define GST_VIDEO_CAPS_ABGR \
     __GST_VIDEO_CAPS_MAKE_32A (4, 3, 2, 1)
 
@@ -300,9 +308,9 @@ typedef enum {
   #define GST_VIDEO_CAPS_BGRx_HOST_ENDIAN \
       GST_VIDEO_CAPS_xRGB
 #endif
-      
+
 /* 15/16 bit */
-  
+
 #define GST_VIDEO_CAPS_RGB_16 \
     __GST_VIDEO_CAPS_MAKE_16 (1, 2, 3)
 
@@ -342,9 +350,9 @@ typedef enum {
  */
 #define GST_VIDEO_CAPS_RGB8_PALETTED \
   "video/x-raw-rgb, bpp = (int)8, depth = (int)8, "                     \
-      "width = "GST_VIDEO_SIZE_RANGE" , "		                \
+      "width = " GST_VIDEO_SIZE_RANGE ", "		                \
       "height = " GST_VIDEO_SIZE_RANGE ", "                             \
-      "framerate = "GST_VIDEO_FPS_RANGE
+      "framerate = " GST_VIDEO_FPS_RANGE
 
 /**
  * GST_VIDEO_CAPS_YUV:

@@ -2,6 +2,7 @@
  * Copyright (C) <1999> Erik Walthinsen <omega@cse.ogi.edu>
  * This file:
  * Copyright (c) 2002-2004 Ronald Bultje <rbultje@ronald.bitfreak.net>
+ * Copyright (C) 2012, 2013 Samsung Electronics Co., Ltd.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -17,6 +18,9 @@
  * License along with this library; if not, write to the
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 02111-1307, USA.
+ *
+ * * Modifications by Samsung Electronics Co., Ltd.
+ * 1. Support samsung extension format
  */
 
 #ifdef HAVE_CONFIG_H
@@ -630,6 +634,7 @@ gst_ffmpeg_caps_to_pixfmt (const GstCaps * caps,
           break;
         case GST_MAKE_FOURCC ('U', 'Y', 'V', 'Y'):
         case GST_MAKE_FOURCC ('S', 'Y', 'V', 'Y'):
+        case GST_MAKE_FOURCC ('I', 'T', 'L', 'V'):
           context->pix_fmt = PIX_FMT_UYVY422;
           break;
         case GST_MAKE_FOURCC ('Y', 'V', 'Y', 'U'):

@@ -329,7 +329,7 @@ gst_ring_buffer_parse_caps (GstRingBufferSpec * spec, GstCaps * caps)
   /* we have to differentiate between int and float formats */
   mimetype = gst_structure_get_name (structure);
 
-  if (g_str_equal (mimetype, "audio/x-raw-int")) {
+  if (g_str_equal (mimetype, "audio/x-raw-int") || g_str_equal (mimetype, "audio/x-lpcm")) {
     gint endianness;
     const FormatDef *def;
     gint j, bytes;

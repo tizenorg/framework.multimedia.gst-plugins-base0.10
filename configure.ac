@@ -118,6 +118,14 @@ AG_GST_ARG_ENABLE_EXTERNAL
 
 AG_GST_ARG_ENABLE_EXPERIMENTAL
 
+PKG_CHECK_MODULES(DRM, libdrm)
+AC_SUBST(DRM_CFLAGS)
+AC_SUBST(DRM_LIBS)
+
+PKG_CHECK_MODULES(DRM, libdrm-devel)
+AC_SUBST(DRM_DEVEL_CFLAGS)
+AC_SUBST(DRM_DEVEL_LIBS)
+
 dnl *** checks for platform ***
 AG_GST_PLATFORM
 
@@ -434,9 +442,15 @@ AG_GST_CHECK_PLUGIN(volume)
 
 dnl check for gstreamer core features (subsystems)
 dnl FIXME: this assumes srcdir == builddir for uninstalled setups
-GST_CONFIGPATH=`$PKG_CONFIG --variable=includedir gstreamer-0.10`"/gst/gstconfig.h"
-AG_GST_PARSE_SUBSYSTEM_DISABLES($GST_CONFIGPATH)
-AM_CONDITIONAL(USE_XML, test $GST_DISABLE_XML != "1")
+dnl YeJin Cho : subparse needs xml for parsing smi, enalbe USE_XML
+dnl GST_CONFIGPATH=`$PKG_CONFIG --variable=includedir gstreamer-0.10`"/gst/gstconfig.h"
+dnl AG_GST_PARSE_SUBSYSTEM_DISABLES($GST_CONFIGPATH)
+dnl AM_CONDITIONAL(USE_XML, test $GST_DISABLE_XML != "1")
+
+AM_CONDITIONAL(USE_XML, true)
+PKG_CHECK_MODULES(XML, libxml-2.0)
+AC_SUBST(XML_CFLAGS)
+AC_SUBST(XML_LIBS)
 
 dnl disable plug-ins that require libxml2's HTML support if it is not available
 if test "x$HAVE_LIBXML_HTML" != "xyes"; then
@@ -922,6 +936,42 @@ dnl this really should only contain flags, not libs - they get added before
 dnl whatevertarget_LIBS and -L flags here affect the rest of the linking
 GST_PLUGIN_LDFLAGS="-module -avoid-version -export-symbols-regex '^[_]*gst_plugin_desc.*' $GST_ALL_LDFLAGS"
 AC_SUBST(GST_PLUGIN_LDFLAGS)
+
+dnl use xfixes
+PKG_CHECK_MODULES(XFIXES, xfixes)
+AC_SUBST(XFIXES_CFLAGS)
+AC_SUBST(XFIXES_LIBS)
+
+dnl use dri2proto
+PKG_CHECK_MODULES(DRI2PROTO, dri2proto)
+AC_SUBST(DRI2PROTO_CFLAGS)
+AC_SUBST(DRI2PROTO_LIBS)
+
+dnl use dri2
+PKG_CHECK_MODULES(DRI2, libdri2)
+AC_SUBST(DRI2_CFLAGS)
+AC_SUBST(DRI2_LIBS)
+
+dnl use tbm
+PKG_CHECK_MODULES(TBM, libtbm)
+AC_SUBST(TBM_CFLAGS)
+AC_SUBST(TBM_LIBS)
+
+dnl Check Savs Codec Packages
+#PKG_CHECK_MODULES(SAVSCODEC_HEVC, libsavscodec-neon-hevc)
+#AC_SUBST(SAVSCODEC_HEVC_LDFLAGS)
+#AC_SUBST(SAVSCODEC_HEVC_CFLAGS)
+#AC_SUBST(SAVSCODEC_HEVC_LIBS)
+
+dnl use utilX
+PKG_CHECK_MODULES(UTILX, utilX)
+AC_SUBST(UTILX_CFLAGS)
+AC_SUBST(UTILX_LIBS)
+
+dnl use vconf
+PKG_CHECK_MODULES(VCONF, vconf)
+AC_SUBST(VCONF_CFLAGS)
+AC_SUBST(VCONF_LIBS)
 
 dnl *** output files ***
 

@@ -1,6 +1,7 @@
 /* GStreamer
  * Copyright (C) <2005> Julien Moutte <julien@moutte.net>
  *               <2009>,<2010> Stefan Kost <stefan.kost@nokia.com>
+ * Copyright (C) 2012, 2013 Samsung Electronics Co., Ltd.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -16,6 +17,11 @@
  * License along with this library; if not, write to the
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 02111-1307, USA.
+ *
+ * * Modifications by Samsung Electronics Co., Ltd.
+ * 1. Add display related properties
+ * 2. Support samsung extension format to improve performance
+ * 3. Support video texture overlay of OSP layer
  */
 
 /**
@@ -129,6 +135,59 @@
 /* For xv extension header for buffer transfer (output) */
 #include "xv_types.h"
 
+/* headers for drm */
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <X11/Xmd.h>
+#include <dri2/dri2.h>
+#include <tbm_bufmgr.h>
+
+/* for setting vconf about xv state */
+#include <vconf.h>
+#include <vconf-internal-player-keys.h>
+
+
+enum {
+    SECURE_PATH_INIT = -1,
+    SECURE_PATH_OFF = 0,
+    SECURE_PATH_ON = 1
+};
+
+enum {
+    DRM_LEVEL_0 = 0,
+    DRM_LEVEL_1
+ };
+
+enum
+{
+  DISPLAY_STATUS_NULL = 0,
+  DISPLAY_STATUS_HDMI_ACTIVE,
+  DISPLAY_STATUS_UNKNOWN_ACTIVE,
+};
+
+enum
+{
+  XV_STATUS_NULL = 0,
+  XV_STATUS_READY,
+  XV_STATUS_PAUSED,
+  XV_STATUS_PLAYING,
+  XV_STATUS_SEEK,
+};
+
+typedef enum {
+        BUF_SHARE_METHOD_PADDR = 0,
+        BUF_SHARE_METHOD_FD,
+        BUF_SHARE_METHOD_TIZEN_BUFFER,
+        BUF_SHARE_METHOD_FLUSH_BUFFER
+} buf_share_method_t;
+
+#define _CHECK_DISPLAYED_BUFFER_COUNT   15
+#define _EVENT_THREAD_CHECK_INTERVAL    15000   /* us */
+
 /* max channel count *********************************************************/
 #define SCMN_IMGB_MAX_PLANE         (4)
 
@@ -157,28 +216,48 @@
 typedef struct
 {
 	/* width of each image plane */
-	int      w[SCMN_IMGB_MAX_PLANE];
+	int w[SCMN_IMGB_MAX_PLANE];
 	/* height of each image plane */
-	int      h[SCMN_IMGB_MAX_PLANE];
+	int h[SCMN_IMGB_MAX_PLANE];
 	/* stride of each image plane */
-	int      s[SCMN_IMGB_MAX_PLANE];
+	int s[SCMN_IMGB_MAX_PLANE];
 	/* elevation of each image plane */
-	int      e[SCMN_IMGB_MAX_PLANE];
+	int e[SCMN_IMGB_MAX_PLANE];
 	/* user space address of each image plane */
-	void   * a[SCMN_IMGB_MAX_PLANE];
+	void *a[SCMN_IMGB_MAX_PLANE];
 	/* physical address of each image plane, if needs */
-	void   * p[SCMN_IMGB_MAX_PLANE];
+	void *p[SCMN_IMGB_MAX_PLANE];
 	/* color space type of image */
-	int      cs;
+	int cs;
 	/* left postion, if needs */
-	int      x;
+	int x;
 	/* top position, if needs */
-	int      y;
+	int y;
 	/* to align memory */
-	int      __dummy2;
+	int __dummy2;
 	/* arbitrary data */
-	int      data[16];
+	int data[16];
+	/* dma buf fd */
+	int dmabuf_fd[SCMN_IMGB_MAX_PLANE];
+	/* buffer share method */
+	int buf_share_method;
+	/* Y plane size in case of ST12 */
+	int y_size;
+	/* UV plane size in case of ST12 */
+	int uv_size;
+	/* Tizen buffer object */
+	void *bo[SCMN_IMGB_MAX_PLANE];
+	/* JPEG data */
+	void *jpeg_data;
+	/* JPEG size */
+	int jpeg_size;
+	/* TZ memory buffer */
+	int tz_enable;
 } SCMN_IMGB;
+
+static void _release_flush_buffer(GstXvImageSink *xvimagesink);
+static void _remove_last_buffer(GstXvImageSink *xvimagesink);
+static gboolean gst_xvimagesink_make_flush_buffer(GstXvImageSink *xvimagesink);
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
 /* Debugging category */
@@ -192,6 +271,7 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_PERFORMANCE);
 
 #ifdef GST_EXT_XV_ENHANCEMENT
 #define GST_TYPE_XVIMAGESINK_DISPLAY_MODE (gst_xvimagesink_display_mode_get_type())
+#define GST_TYPE_XVIMAGESINK_CSC_RANGE (gst_xvimagesink_csc_range_get_type())
 
 static GType
 gst_xvimagesink_display_mode_get_type(void)
@@ -209,6 +289,23 @@ gst_xvimagesink_display_mode_get_type(void)
 	}
 
 	return xvimagesink_display_mode_type;
+}
+
+static GType
+gst_xvimagesink_csc_range_get_type(void)
+{
+	static GType xvimagesink_csc_range_type = 0;
+	static const GEnumValue csc_range_type[] = {
+		{ 0, "Narrow range", "NARROW"},
+		{ 1, "Wide range", "WIDE"},
+		{ 2, NULL, NULL},
+	};
+
+	if (!xvimagesink_csc_range_type) {
+		xvimagesink_csc_range_type = g_enum_register_static("GstXVImageSinkCSCRangeType", csc_range_type);
+	}
+
+	return xvimagesink_csc_range_type;
 }
 
 enum {
@@ -245,13 +342,32 @@ enum {
     DISP_GEO_METHOD_ORIGIN_SIZE,
     DISP_GEO_METHOD_FULL_SCREEN,
     DISP_GEO_METHOD_CROPPED_FULL_SCREEN,
-    DISP_GEO_METHOD_CUSTOM_ROI,
+    DISP_GEO_METHOD_ORIGIN_SIZE_OR_LETTER_BOX,
+    DISP_GEO_METHOD_CUSTOM_DST_ROI,
     DISP_GEO_METHOD_NUM,
 };
 
-#define DEF_DISPLAY_GEOMETRY_METHOD DISP_GEO_METHOD_LETTER_BOX
+enum {
+    ROI_DISP_GEO_METHOD_FULL_SCREEN = 0,
+    ROI_DISP_GEO_METHOD_LETTER_BOX,
+    ROI_DISP_GEO_METHOD_NUM,
+};
+
+#define DEF_DISPLAY_GEOMETRY_METHOD         DISP_GEO_METHOD_LETTER_BOX
+#define DEF_ROI_DISPLAY_GEOMETRY_METHOD     ROI_DISP_GEO_METHOD_FULL_SCREEN
+
+enum {
+    FLIP_NONE = 0,
+    FLIP_HORIZONTAL,
+    FLIP_VERTICAL,
+    FLIP_BOTH,
+    FLIP_NUM,
+};
+#define DEF_DISPLAY_FLIP            FLIP_NONE
 
 #define GST_TYPE_XVIMAGESINK_DISPLAY_GEOMETRY_METHOD (gst_xvimagesink_display_geometry_method_get_type())
+#define GST_TYPE_XVIMAGESINK_ROI_DISPLAY_GEOMETRY_METHOD (gst_xvimagesink_roi_display_geometry_method_get_type())
+#define GST_TYPE_XVIMAGESINK_FLIP                    (gst_xvimagesink_flip_get_type())
 
 static GType
 gst_xvimagesink_display_geometry_method_get_type(void)
@@ -262,8 +378,9 @@ gst_xvimagesink_display_geometry_method_get_type(void)
 		{ 1, "Origin size", "ORIGIN_SIZE"},
 		{ 2, "Full-screen", "FULL_SCREEN"},
 		{ 3, "Cropped full-screen", "CROPPED_FULL_SCREEN"},
-		{ 4, "Explicitely described destination ROI", "CUSTOM_ROI"},
-		{ 5, NULL, NULL},
+		{ 4, "Origin size(if screen size is larger than video size(width/height)) or Letter box(if video size(width/height) is larger than screen size)", "ORIGIN_SIZE_OR_LETTER_BOX"},
+		{ 5, "Explicitly described destination ROI", "CUSTOM_DST_ROI"},
+		{ 6, NULL, NULL},
 	};
 
 	if (!xvimagesink_display_geometry_method_type) {
@@ -272,6 +389,92 @@ gst_xvimagesink_display_geometry_method_get_type(void)
 
 	return xvimagesink_display_geometry_method_type;
 }
+
+static GType
+gst_xvimagesink_roi_display_geometry_method_get_type(void)
+{
+	static GType xvimagesink_roi_display_geometry_method_type = 0;
+	static const GEnumValue roi_display_geometry_method_type[] = {
+		{ 0, "ROI-Full-screen", "FULL_SCREEN"},
+		{ 1, "ROI-Letter box", "LETTER_BOX"},
+		{ 2, NULL, NULL},
+	};
+
+	if (!xvimagesink_roi_display_geometry_method_type) {
+		xvimagesink_roi_display_geometry_method_type = g_enum_register_static("GstXVImageSinkROIDisplayGeometryMethodType", roi_display_geometry_method_type);
+	}
+
+	return xvimagesink_roi_display_geometry_method_type;
+}
+
+static GType
+gst_xvimagesink_flip_get_type(void)
+{
+	static GType xvimagesink_flip_type = 0;
+	static const GEnumValue flip_type[] = {
+		{ FLIP_NONE,       "Flip NONE", "FLIP_NONE"},
+		{ FLIP_HORIZONTAL, "Flip HORIZONTAL", "FLIP_HORIZONTAL"},
+		{ FLIP_VERTICAL,   "Flip VERTICAL", "FLIP_VERTICAL"},
+		{ FLIP_BOTH,       "Flip BOTH", "FLIP_BOTH"},
+		{ FLIP_NUM, NULL, NULL},
+	};
+
+	if (!xvimagesink_flip_type) {
+		xvimagesink_flip_type = g_enum_register_static("GstXVImageSinkFlipType", flip_type);
+	}
+
+	return xvimagesink_flip_type;
+}
+
+#define g_marshal_value_peek_pointer(v)  (v)->data[0].v_pointer
+void
+gst_xvimagesink_BOOLEAN__POINTER (GClosure         *closure,
+                                     GValue         *return_value G_GNUC_UNUSED,
+                                     guint          n_param_values,
+                                     const GValue   *param_values,
+                                     gpointer       invocation_hint G_GNUC_UNUSED,
+                                     gpointer       marshal_data)
+{
+  typedef gboolean (*GMarshalFunc_BOOLEAN__POINTER) (gpointer     data1,
+                                                     gpointer     arg_1,
+                                                     gpointer     data2);
+  register GMarshalFunc_BOOLEAN__POINTER callback;
+  register GCClosure *cc = (GCClosure*) closure;
+  register gpointer data1, data2;
+
+  gboolean v_return;
+
+  g_return_if_fail (return_value != NULL);
+  g_return_if_fail (n_param_values == 2);
+
+  if (G_CCLOSURE_SWAP_DATA (closure)) {
+    data1 = closure->data;
+    data2 = g_value_peek_pointer (param_values + 0);
+  } else {
+    data1 = g_value_peek_pointer (param_values + 0);
+    data2 = closure->data;
+  }
+  callback = (GMarshalFunc_BOOLEAN__POINTER) (marshal_data ? marshal_data : cc->callback);
+
+  v_return = callback (data1,
+                      g_marshal_value_peek_pointer (param_values + 1),
+                      data2);
+
+  g_value_set_boolean (return_value, v_return);
+}
+
+enum
+{
+    SIGNAL_FRAME_RENDER_ERROR,
+    SIGNAL_DISPLAY_STATUS,
+    SIGNAL_EXTERNAL_RESOLUTION,
+    SIGNAL_WINDOW_STATUS,
+    SIGNAL_QUICKPANEL_STATUS,
+    SIGNAL_MULTIWINDOW_STATUS,
+    LAST_SIGNAL
+};
+static guint gst_xvimagesink_signals[LAST_SIGNAL] = { 0 };
+
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
 typedef struct
@@ -285,6 +488,11 @@ typedef struct
 MotifWmHints, MwmHints;
 
 #define MWM_HINTS_DECORATIONS   (1L << 1)
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+#define MAX_DISPLAY_IN_XVIMAGESINK  20
+static Display *g_display_id[MAX_DISPLAY_IN_XVIMAGESINK] = {0};
+#endif
 
 static void gst_xvimagesink_reset (GstXvImageSink * xvimagesink);
 
@@ -300,6 +508,16 @@ static void gst_xvimagesink_expose (GstXOverlay * overlay);
 #ifdef GST_EXT_XV_ENHANCEMENT
 static XImage *make_transparent_image(Display *d, Window win, int w, int h);
 static gboolean set_display_mode(GstXContext *xcontext, int set_mode);
+static gboolean set_csc_range(GstXContext *xcontext, int set_range);
+static void gst_xvimagesink_set_pixmap_handle(GstXOverlay *overlay, guintptr id);
+static unsigned int drm_convert_dmabuf_gemname(GstXvImageSink *xvimagesink, unsigned int dmabuf_fd, unsigned int *gem_handle);
+static void drm_close_gem(GstXvImageSink *xvimagesink, unsigned int *gem_handle);
+static void _add_displaying_buffer(GstXvImageSink *xvimagesink, XV_DATA_PTR img_data, GstBuffer *buffer);
+static void _remove_displaying_buffer(GstXvImageSink *xvimagesink, unsigned int *gem_name);
+static int _is_connected_to_external_display(GstXvImageSink *xvimagesink);
+static void check_hdmi_connected(GstXvImageSink *xvimagesink);
+static int get_window_prop_card32_property (Display* dpy, Window win, Atom atom, Atom type, unsigned int *val, unsigned int len);
+static gboolean check_supportable_port_attr(GstXvImageSink * xvimagesink, gchar* attr_name);
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
 /* Default template - initiated with class struct to allow gst-register to work
@@ -340,15 +558,37 @@ enum
   PROP_WINDOW_HEIGHT,
 #ifdef GST_EXT_XV_ENHANCEMENT
   PROP_DISPLAY_MODE,
+  PROP_CSC_RANGE,
   PROP_ROTATE_ANGLE,
+  PROP_FLIP,
   PROP_DISPLAY_GEOMETRY_METHOD,
   PROP_VISIBLE,
   PROP_ZOOM,
+  PROP_ZOOM_POS_X,
+  PROP_ZOOM_POS_Y,
+  PROP_ORIENTATION,
+  PROP_DST_ROI_MODE,
   PROP_DST_ROI_X,
   PROP_DST_ROI_Y,
   PROP_DST_ROI_W,
   PROP_DST_ROI_H,
+  PROP_SRC_CROP_X,
+  PROP_SRC_CROP_Y,
+  PROP_SRC_CROP_W,
+  PROP_SRC_CROP_H,
   PROP_STOP_VIDEO,
+  PROP_PIXMAP_CB,
+  PROP_PIXMAP_CB_USER_DATA,
+  PROP_SUBPICTURE,
+  PROP_EXTERNAL_WIDTH,
+  PROP_EXTERNAL_HEIGHT,
+  PROP_ENABLE_FLUSH_BUFFER,
+  PROP_PIXMAP,
+  PROP_HIDED_WINDOW,
+  PROP_QUICKPANEL_ON,
+  PROP_MULTIWINDOW_ACTIVE,
+  PROP_KEEP_EXTERNAL_FULLSCREEN_POST,
+  PROP_KEEP_EXTERNAL_FULLSCREEN_PREV,
 #endif /* GST_EXT_XV_ENHANCEMENT */
 };
 
@@ -560,8 +800,23 @@ gst_xvimagesink_handle_xerror (Display * display, XErrorEvent * xevent)
   char error_msg[1024];
 
   XGetErrorText (display, xevent->error_code, error_msg, 1024);
-  GST_DEBUG ("xvimagesink triggered an XError. error: %s", error_msg);
-  error_caught = TRUE;
+#ifndef GST_EXT_XV_ENHANCEMENT
+  GST_DEBUG ("xvimagesink triggered an XError. error: %s, display(%p)", error_msg, display);
+#else
+  {
+    int i = 0;
+    for (i = 0; i < MAX_DISPLAY_IN_XVIMAGESINK; i++) {
+      if (g_display_id[i] == display) {
+        GST_ERROR ("xvimagesink triggered an XError. error: %s, display(%p), xevent->request_code: %d", error_msg, display, xevent->request_code);
+        error_caught = TRUE;
+        break;
+      }
+    }
+    if (i == MAX_DISPLAY_IN_XVIMAGESINK) {
+      GST_ERROR ("xvimagesink triggered an XError. error: %s, xevent->request_code: %d, but the display(%p) was not created in xvimagesink, skip it...", error_msg, xevent->request_code, display);
+    }
+  }
+#endif
   return 0;
 }
 
@@ -703,6 +958,10 @@ gst_xvimagesink_xvimage_new (GstXvImageSink * xvimagesink, GstCaps * caps)
     xvimagesink->aligned_width = xvimage->width;
     xvimagesink->aligned_height = xvimage->height;
   }
+  if (xvimagesink->subpicture) {
+    GST_LOG("because of subpicture's format, pass xvimage_new");
+    return xvimage;
+  }
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   xvimage->im_format = gst_xvimagesink_get_format_from_caps (xvimagesink, caps);
@@ -718,6 +977,9 @@ gst_xvimagesink_xvimage_new (GstXvImageSink * xvimagesink, GstCaps * caps)
 
   g_mutex_lock (xvimagesink->x_lock);
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  XSync (xvimagesink->xcontext->disp, FALSE);
+#endif /* GST_EXT_XV_ENHANCEMENT */
   /* Setting an error handler to catch failure */
   error_caught = FALSE;
   handler = XSetErrorHandler (gst_xvimagesink_handle_xerror);
@@ -747,12 +1009,18 @@ gst_xvimagesink_xvimage_new (GstXvImageSink * xvimagesink, GstCaps * caps)
           ("could not XvShmCreateImage a %dx%d image",
               xvimage->width, xvimage->height));
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+      /* must not change "use_xshm",
+         because it causes memory curruption when buffer created by XvShmCreateImage is destroyed */
+      goto beach_unlocked;
+#else /* GST_EXT_XV_ENHANCEMENT */
       /* Retry without XShm */
       xvimagesink->xcontext->use_xshm = FALSE;
 
       /* Hold X mutex again to try without XShm */
       g_mutex_lock (xvimagesink->x_lock);
       goto no_xshm;
+#endif /* GST_EXT_XV_ENHANCEMENT */
     }
 
     /* we have to use the returned data_size for our shm size */
@@ -796,6 +1064,7 @@ gst_xvimagesink_xvimage_new (GstXvImageSink * xvimagesink, GstCaps * caps)
 #ifdef GST_EXT_XV_ENHANCEMENT
       case GST_MAKE_FOURCC ('S', 'T', '1', '2'):
       case GST_MAKE_FOURCC ('S', 'N', '1', '2'):
+      case GST_MAKE_FOURCC ('S', 'N', '2', '1'):
       case GST_MAKE_FOURCC ('S', 'U', 'Y', 'V'):
       case GST_MAKE_FOURCC ('S', 'U', 'Y', '2'):
       case GST_MAKE_FOURCC ('S', '4', '2', '0'):
@@ -872,7 +1141,9 @@ gst_xvimagesink_xvimage_new (GstXvImageSink * xvimagesink, GstCaps * caps)
     GST_DEBUG_OBJECT (xvimagesink, "XServer ShmAttached to 0x%x, id 0x%lx",
         xvimage->SHMInfo.shmid, xvimage->SHMInfo.shmseg);
   } else
+#ifndef GST_EXT_XV_ENHANCEMENT
   no_xshm:
+#endif /* GST_EXT_XV_ENHANCEMENT */
 #endif /* HAVE_XSHM */
   {
     xvimage->xvimage = XvCreateImage (xvimagesink->xcontext->disp,
@@ -978,33 +1249,74 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
 
 #ifdef GST_EXT_XV_ENHANCEMENT
   static Atom atom_rotation = None;
+  static Atom atom_hflip = None;
+  static Atom atom_vflip = None;
+  static Atom atom_contents_rotation = None;
+  gboolean set_hflip = FALSE;
+  gboolean set_vflip = FALSE;
+  XWindowAttributes map_attr;
 
   GstVideoRectangle src_origin = { 0, 0, 0, 0};
   GstVideoRectangle src_input  = { 0, 0, 0, 0};
   GstVideoRectangle src = { 0, 0, 0, 0};
   GstVideoRectangle dst = { 0, 0, 0, 0};
 
+  gint res_rotate_angle = 0;
   int rotate        = 0;
+  int orientation = 0;
   int ret           = 0;
+  int idx           = 0;
+  int (*handler) (Display *, XErrorEvent *) = NULL;
+  gboolean res = FALSE;
+  XV_DATA_PTR img_data = NULL;
+
+  if (xvimagesink->is_subpicture_format)
+    return TRUE;
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   /* We take the flow_lock. If expose is in there we don't want to run
      concurrently from the data flow thread */
   g_mutex_lock (xvimagesink->flow_lock);
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (xvimagesink->xid_updated) {
+    if (xvimage && xvimagesink->xvimage == NULL) {
+      GST_WARNING_OBJECT (xvimagesink, "set xvimage to NULL, new xid was set right after creation of new xvimage");
+      xvimage = NULL;
+    }
+    xvimagesink->xid_updated = FALSE;
+  }
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
   if (G_UNLIKELY (xvimagesink->xwindow == NULL)) {
 #ifdef GST_EXT_XV_ENHANCEMENT
-    GST_INFO_OBJECT( xvimagesink, "xwindow is NULL. Skip xvimage_put." );
-#endif /* GST_EXT_XV_ENHANCEMENT */
+    if (xvimagesink->get_pixmap_cb) {
+      GST_INFO_OBJECT( xvimagesink, "xwindow is NULL, but it has get_pixmap_cb(0x%x), keep going..",xvimagesink->get_pixmap_cb );
+    } else {
+      GST_INFO_OBJECT( xvimagesink, "xwindow is NULL. Skip xvimage_put." );
+      g_mutex_unlock(xvimagesink->flow_lock);
+      return FALSE;
+    }
+#else /* GST_EXT_XV_ENHANCEMENT */
     g_mutex_unlock (xvimagesink->flow_lock);
     return FALSE;
+#endif /* GST_EXT_XV_ENHANCEMENT */
   }
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-  if (xvimagesink->visible == FALSE) {
-    GST_INFO_OBJECT(xvimagesink, "visible is FALSE. Skip xvimage_put.");
-    g_mutex_unlock(xvimagesink->flow_lock);
-    return TRUE;
+  /* check map status of window */
+  if(!xvimagesink->is_pixmap) {
+    if (xvimagesink->xcontext && xvimagesink->xwindow) {
+      if (XGetWindowAttributes(xvimagesink->xcontext->disp, xvimagesink->xwindow->win, &map_attr)) {
+        if (map_attr.map_state != IsViewable) {
+          GST_WARNING_OBJECT(xvimagesink, "window is unmapped, skip putimage");
+          g_mutex_unlock(xvimagesink->flow_lock);
+          return TRUE;
+        }
+      } else {
+      GST_WARNING_OBJECT(xvimagesink, "XGetWindowAttributes failed");
+      }
+    }
   }
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
@@ -1027,12 +1339,24 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
 
   /* Expose sends a NULL image, we take the latest frame */
   if (!xvimage) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+    g_mutex_lock(xvimagesink->display_buffer_lock);
+    if (xvimagesink->is_zero_copy_format  &&
+        xvimagesink->displaying_buffer_count < 1) {
+      g_mutex_unlock(xvimagesink->display_buffer_lock);
+      g_mutex_unlock (xvimagesink->flow_lock);
+      GST_WARNING_OBJECT(xvimagesink, "no buffer to display. skip putimage");
+      return TRUE;
+    }
+    g_mutex_unlock(xvimagesink->display_buffer_lock);
+#endif /* GST_EXT_XV_ENHANCEMENT */
     if (xvimagesink->cur_image) {
       draw_border = TRUE;
       xvimage = xvimagesink->cur_image;
     } else {
 #ifdef GST_EXT_XV_ENHANCEMENT
-      GST_INFO_OBJECT(xvimagesink, "cur_image is NULL. Skip xvimage_put.");
+      GST_WARNING_OBJECT(xvimagesink, "cur_image is NULL. Skip xvimage_put.");
+      /* no need to release gem handle */
 #endif /* GST_EXT_XV_ENHANCEMENT */
       g_mutex_unlock (xvimagesink->flow_lock);
       return TRUE;
@@ -1040,13 +1364,78 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
   }
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-  gst_xvimagesink_xwindow_update_geometry( xvimagesink );
+  gboolean enable_last_buffer;
+  g_object_get(G_OBJECT(xvimagesink), "enable-last-buffer", &enable_last_buffer, NULL);
+  if(enable_last_buffer) {
+    if (xvimagesink->cur_image && xvimagesink->is_zero_copy_format) {
+      GstBuffer *last_buffer= NULL;
+      g_object_get(G_OBJECT(xvimagesink), "last-buffer", &last_buffer, NULL);
+      if (last_buffer) {
+        if(last_buffer != xvimagesink->cur_image)
+        {
+          GST_LOG("curimage : %p , last_buffer : %p", xvimagesink->cur_image, last_buffer);
+        }
+      } else {
+        GST_WARNING_OBJECT(xvimagesink, "zero copy format and last buffer is NULL, so skip this putimage");
+        g_mutex_unlock (xvimagesink->flow_lock);
+        return TRUE;
+      }
+      gst_buffer_unref(last_buffer);
+      last_buffer = NULL;
+    }
+  }
+
+  if (xvimagesink->visible == FALSE ||
+      (xvimagesink->is_hided && GST_STATE(xvimagesink) != GST_STATE_PLAYING)) {
+    GST_INFO("visible[%d] or is_hided[%d]. Skip xvimage_put.",
+             xvimagesink->visible, xvimagesink->is_hided);
+    g_mutex_unlock(xvimagesink->flow_lock);
+    return TRUE;
+  }
+
+  if (!xvimagesink->get_pixmap_cb) {
+    gst_xvimagesink_xwindow_update_geometry( xvimagesink );
+    if (!xvimagesink->subpicture && !xvimagesink->is_during_seek) {
+      if(xvimagesink->is_multi_window && (GST_STATE(xvimagesink) != GST_STATE_PLAYING)) {
+        set_display_mode(xvimagesink->xcontext, DISPLAY_MODE_PRI_VIDEO_ON_AND_SEC_VIDEO_CLONE);
+      } else {
+        set_display_mode(xvimagesink->xcontext, xvimagesink->display_mode);
+      }
+    }
+  } else {
+    /* for multi-pixmap usage for the video texture */
+    gst_xvimagesink_set_pixmap_handle ((GstXOverlay *)xvimagesink, xvimagesink->get_pixmap_cb(xvimagesink->get_pixmap_cb_user_data));
+    idx = xvimagesink->current_pixmap_idx;
+    if (idx == -1) {
+      g_mutex_unlock (xvimagesink->flow_lock);
+      return FALSE;
+    } else if (idx == -2) {
+      GST_WARNING_OBJECT(xvimagesink, "Skip putImage()");
+      g_mutex_unlock (xvimagesink->flow_lock);
+      return TRUE;
+    }
+  }
+
+  res_rotate_angle = xvimagesink->rotate_angle;
 
   src.x = src.y = 0;
   src_origin.x = src_origin.y = src_input.x = src_input.y = 0;
 
   src_input.w = src_origin.w = xvimagesink->video_width;
   src_input.h = src_origin.h = xvimagesink->video_height;
+
+  if ((xvimagesink->display_geometry_method == DISP_GEO_METHOD_LETTER_BOX ||
+      xvimagesink->display_geometry_method == DISP_GEO_METHOD_FULL_SCREEN ||
+      xvimagesink->display_geometry_method == DISP_GEO_METHOD_CUSTOM_DST_ROI) &&
+      xvimagesink->src_crop.w && xvimagesink->src_crop.h) {
+      GST_LOG_OBJECT(xvimagesink, "set src crop %d,%d,%dx%d -> %d,%d,%dx%d",
+                                  src_input.x, src_input.y, src_input.w, src_input.h,
+                                  xvimagesink->src_crop.x, xvimagesink->src_crop.y, xvimagesink->src_crop.w, xvimagesink->src_crop.h);
+      src_input.x = src_origin.w = xvimagesink->src_crop.x;
+      src_input.y = src_origin.y = xvimagesink->src_crop.y;
+      src_input.w = src_origin.w = xvimagesink->src_crop.w;
+      src_input.h = src_origin.h = xvimagesink->src_crop.h;
+  }
 
   if (xvimagesink->rotate_angle == DEGREE_0 ||
       xvimagesink->rotate_angle == DEGREE_180) {
@@ -1086,8 +1475,13 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
 
    case DISP_GEO_METHOD_FULL_SCREEN:
       result.x = result.y = 0;
-      result.w = xvimagesink->xwindow->width;
-      result.h = xvimagesink->xwindow->height;
+      if (!xvimagesink->get_pixmap_cb) {
+        result.w = xvimagesink->xwindow->width;
+        result.h = xvimagesink->xwindow->height;
+      } else {
+        result.w = xvimagesink->xpixmap[idx]->width;
+        result.h = xvimagesink->xpixmap[idx]->height;
+      }
       break;
 
    case DISP_GEO_METHOD_CROPPED_FULL_SCREEN:
@@ -1109,66 +1503,185 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
       }
       break;
 
-    case DISP_GEO_METHOD_CUSTOM_ROI:
-#ifdef GST_EXT_XV_ENHANCEMENT_ROI_MODE
-      switch (xvimagesink->rotate_angle) {
-      case DEGREE_90:
-        result.w = xvimagesink->dst_roi.h;
-        result.h = xvimagesink->dst_roi.w;
+   case DISP_GEO_METHOD_ORIGIN_SIZE_OR_LETTER_BOX:
+     if (src.w > dst.w || src.h > dst.h) {
+       /* LETTER BOX */
+       gst_video_sink_center_rect (src, dst, &result, TRUE);
+       result.x += xvimagesink->render_rect.x;
+       result.y += xvimagesink->render_rect.y;
+     } else {
+       /* ORIGIN SIZE */
+       gst_video_sink_center_rect (src, dst, &result, FALSE);
+       gst_video_sink_center_rect (dst, src, &src_input, FALSE);
 
-        result.x = xvimagesink->dst_roi.y;
-        result.y = xvimagesink->xwindow->height - xvimagesink->dst_roi.x - xvimagesink->dst_roi.w;
+       if (xvimagesink->rotate_angle == DEGREE_90 ||
+           xvimagesink->rotate_angle == DEGREE_270) {
+         src_input.x = src_input.x ^ src_input.y;
+         src_input.y = src_input.x ^ src_input.y;
+         src_input.x = src_input.x ^ src_input.y;
+
+         src_input.w = src_input.w ^ src_input.h;
+         src_input.h = src_input.w ^ src_input.h;
+         src_input.w = src_input.w ^ src_input.h;
+       }
+     }
+     break;
+
+    case DISP_GEO_METHOD_CUSTOM_DST_ROI:
+    {
+      GstVideoRectangle dst_roi_cmpns;
+      dst_roi_cmpns.w = xvimagesink->dst_roi.w;
+      dst_roi_cmpns.h = xvimagesink->dst_roi.h;
+      dst_roi_cmpns.x = xvimagesink->dst_roi.x;
+      dst_roi_cmpns.y = xvimagesink->dst_roi.y;
+
+      /* setting for DST ROI mode */
+      switch (xvimagesink->dst_roi_mode) {
+      case ROI_DISP_GEO_METHOD_FULL_SCREEN:
         break;
-      case DEGREE_180:
-        result.w = xvimagesink->dst_roi.w;
-        result.h = xvimagesink->dst_roi.h;
+      case ROI_DISP_GEO_METHOD_LETTER_BOX:
+       {
+        GstVideoRectangle roi_result;
+        if (xvimagesink->orientation == DEGREE_0 ||
+            xvimagesink->orientation == DEGREE_180) {
+          src.w = src_origin.w;
+          src.h = src_origin.h;
+        } else {
+          src.w = src_origin.h;
+          src.h = src_origin.w;
+        }
+        dst.w = xvimagesink->dst_roi.w;
+        dst.h = xvimagesink->dst_roi.h;
 
-        result.x = xvimagesink->xwindow->width - result.w - xvimagesink->dst_roi.x;
-        result.y = xvimagesink->xwindow->height - result.h - xvimagesink->dst_roi.y;
-        break;
-      case DEGREE_270:
-        result.w = xvimagesink->dst_roi.h;
-        result.h = xvimagesink->dst_roi.w;
-
-        result.x = xvimagesink->xwindow->width - xvimagesink->dst_roi.y - xvimagesink->dst_roi.h;
-        result.y = xvimagesink->dst_roi.x;
+        gst_video_sink_center_rect (src, dst, &roi_result, TRUE);
+        dst_roi_cmpns.w = roi_result.w;
+        dst_roi_cmpns.h = roi_result.h;
+        dst_roi_cmpns.x = xvimagesink->dst_roi.x + roi_result.x;
+        dst_roi_cmpns.y = xvimagesink->dst_roi.y + roi_result.y;
+       }
         break;
       default:
-        result.x = xvimagesink->dst_roi.x;
-        result.y = xvimagesink->dst_roi.y;
-        result.w = xvimagesink->dst_roi.w;
-        result.h = xvimagesink->dst_roi.h;
         break;
       }
 
-      GST_LOG_OBJECT(xvimagesink, "rotate[%d], ROI input[%d,%d,%dx%d] > result[%d,%d,%dx%d]",
-                     xvimagesink->rotate_angle,
+      /* calculating coordinates according to rotation angle for DST ROI */
+      switch (xvimagesink->rotate_angle) {
+      case DEGREE_90:
+        result.w = dst_roi_cmpns.h;
+        result.h = dst_roi_cmpns.w;
+
+        result.x = dst_roi_cmpns.y;
+        if (!xvimagesink->get_pixmap_cb) {
+          result.y = xvimagesink->xwindow->height - dst_roi_cmpns.x - dst_roi_cmpns.w;
+        } else {
+          result.y = xvimagesink->xpixmap[idx]->height - dst_roi_cmpns.x - dst_roi_cmpns.w;
+        }
+        break;
+      case DEGREE_180:
+        result.w = dst_roi_cmpns.w;
+        result.h = dst_roi_cmpns.h;
+
+        if (!xvimagesink->get_pixmap_cb) {
+          result.x = xvimagesink->xwindow->width - result.w - dst_roi_cmpns.x;
+          result.y = xvimagesink->xwindow->height - result.h - dst_roi_cmpns.y;
+        } else {
+          result.x = xvimagesink->xpixmap[idx]->width - result.w - dst_roi_cmpns.x;
+          result.y = xvimagesink->xpixmap[idx]->height - result.h - dst_roi_cmpns.y;
+        }
+        break;
+      case DEGREE_270:
+        result.w = dst_roi_cmpns.h;
+        result.h = dst_roi_cmpns.w;
+
+        if (!xvimagesink->get_pixmap_cb) {
+          result.x = xvimagesink->xwindow->width - dst_roi_cmpns.y - dst_roi_cmpns.h;
+        } else {
+          result.x = xvimagesink->xpixmap[idx]->width - dst_roi_cmpns.y - dst_roi_cmpns.h;
+        }
+        result.y = dst_roi_cmpns.x;
+        break;
+      default:
+        result.x = dst_roi_cmpns.x;
+        result.y = dst_roi_cmpns.y;
+        result.w = dst_roi_cmpns.w;
+        result.h = dst_roi_cmpns.h;
+        break;
+      }
+
+      /* orientation setting for auto rotation in DST ROI */
+      if (xvimagesink->orientation) {
+        res_rotate_angle = (xvimagesink->rotate_angle - xvimagesink->orientation);
+        if (res_rotate_angle < 0) {
+          res_rotate_angle += DEGREE_NUM;
+        }
+        GST_LOG_OBJECT(xvimagesink, "changing rotation value internally by ROI orientation[%d] : rotate[%d->%d]",
+                     xvimagesink->orientation, xvimagesink->rotate_angle, res_rotate_angle);
+      }
+
+      GST_LOG_OBJECT(xvimagesink, "rotate[%d], dst ROI: orientation[%d], mode[%d], input[%d,%d,%dx%d]->result[%d,%d,%dx%d]",
+                     xvimagesink->rotate_angle, xvimagesink->orientation, xvimagesink->dst_roi_mode,
                      xvimagesink->dst_roi.x, xvimagesink->dst_roi.y, xvimagesink->dst_roi.w, xvimagesink->dst_roi.h,
                      result.x, result.y, result.w, result.h);
-#else /* GST_EXT_XV_ENHANCEMENT_ROI_MODE */
-      result.x = xvimagesink->dst_roi.x;
-      result.y = xvimagesink->dst_roi.y;
-      result.w = xvimagesink->dst_roi.w;
-      result.h = xvimagesink->dst_roi.h;
-
-      if (xvimagesink->rotate_angle == DEGREE_90 ||
-          xvimagesink->rotate_angle == DEGREE_270) {
-        result.w = xvimagesink->dst_roi.h;
-        result.h = xvimagesink->dst_roi.w;
-      }
-#endif /* GST_EXT_XV_ENHANCEMENT_ROI_MODE */
       break;
-
+    }
     default:
       break;
   }
 
-  if (xvimagesink->zoom > 1 && xvimagesink->zoom < 10) {
-    src_input.x += (src_input.w-(src_input.w/xvimagesink->zoom))>>1;
-    src_input.y += (src_input.h-(src_input.h/xvimagesink->zoom))>>1;
-    src_input.w /= xvimagesink->zoom;
-    src_input.h /= xvimagesink->zoom;
+  if (xvimagesink->zoom > 1.0 && xvimagesink->zoom <= 9.0) {
+    GST_LOG_OBJECT(xvimagesink, "before zoom[%lf], src_input[x:%d,y:%d,w:%d,h:%d]",
+                   xvimagesink->zoom, src_input.x, src_input.y, src_input.w, src_input.h);
+    gint default_offset_x = 0;
+    gint default_offset_y = 0;
+    gfloat w = (gfloat)src_input.w;
+    gfloat h = (gfloat)src_input.h;
+    if (xvimagesink->orientation == DEGREE_0 ||
+        xvimagesink->orientation == DEGREE_180) {
+      default_offset_x = ((gint)(w - (w/xvimagesink->zoom)))>>1;
+      default_offset_y = ((gint)(h - (h/xvimagesink->zoom)))>>1;
+    } else {
+      default_offset_y = ((gint)(w - (w/xvimagesink->zoom)))>>1;
+      default_offset_x = ((gint)(h - (h/xvimagesink->zoom)))>>1;
+    }
+    GST_LOG_OBJECT(xvimagesink, "default offset x[%d] y[%d], orientation[%d]", default_offset_x, default_offset_y, xvimagesink->orientation);
+    if (xvimagesink->zoom_pos_x == -1) {
+      src_input.x += default_offset_x;
+    } else {
+      if (xvimagesink->orientation == DEGREE_0 ||
+          xvimagesink->orientation == DEGREE_180) {
+        if ((w/xvimagesink->zoom) > w - xvimagesink->zoom_pos_x) {
+          xvimagesink->zoom_pos_x = w - (w/xvimagesink->zoom);
+        }
+        src_input.x += xvimagesink->zoom_pos_x;
+      } else {
+        if ((h/xvimagesink->zoom) > h - xvimagesink->zoom_pos_x) {
+          xvimagesink->zoom_pos_x = h - (h/xvimagesink->zoom);
+        }
+        src_input.y += (h - h/xvimagesink->zoom) - xvimagesink->zoom_pos_x;
+      }
+    }
+    if (xvimagesink->zoom_pos_y == -1) {
+      src_input.y += default_offset_y;
+    } else {
+      if (xvimagesink->orientation == DEGREE_0 ||
+          xvimagesink->orientation == DEGREE_180) {
+        if ((h/xvimagesink->zoom) > h - xvimagesink->zoom_pos_y) {
+          xvimagesink->zoom_pos_y = h - (h/xvimagesink->zoom);
+        }
+        src_input.y += xvimagesink->zoom_pos_y;
+      } else {
+        if ((w/xvimagesink->zoom) > w - xvimagesink->zoom_pos_y) {
+          xvimagesink->zoom_pos_y = w - (w/xvimagesink->zoom);
+        }
+        src_input.x += (xvimagesink->zoom_pos_y);
+      }
+    }
+    src_input.w = (gint)(w/xvimagesink->zoom);
+    src_input.h = (gint)(h/xvimagesink->zoom);
+    GST_LOG_OBJECT(xvimagesink, "after zoom[%lf], src_input[x:%d,y:%d,w:%d,h%d], zoom_pos[x:%d,y:%d]",
+                   xvimagesink->zoom, src_input.x, src_input.y, src_input.w, src_input.h, xvimagesink->zoom_pos_x, xvimagesink->zoom_pos_y);
   }
+
 #else /* GST_EXT_XV_ENHANCEMENT */
   if (xvimagesink->keep_aspect) {
     GstVideoRectangle src, dst;
@@ -1190,7 +1703,11 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
 
   g_mutex_lock (xvimagesink->x_lock);
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (draw_border && xvimagesink->draw_borders && !xvimagesink->get_pixmap_cb) {
+#else
   if (draw_border && xvimagesink->draw_borders) {
+#endif /* GST_EXT_XV_ENHANCEMENT */
     gst_xvimagesink_xwindow_draw_borders (xvimagesink, xvimagesink->xwindow,
         result);
     xvimagesink->redraw_border = FALSE;
@@ -1206,7 +1723,7 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
         xvimagesink->render_rect.w, xvimagesink->render_rect.h, xvimage);
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-    switch( xvimagesink->rotate_angle )
+    switch( res_rotate_angle )
     {
       /* There's slightly weired code (CCW? CW?) */
       case DEGREE_0:
@@ -1222,7 +1739,7 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
         break;
       default:
         GST_WARNING_OBJECT( xvimagesink, "Unsupported rotation [%d]... set DEGREE 0.",
-          xvimagesink->rotate_angle );
+          res_rotate_angle );
         break;
     }
 
@@ -1234,31 +1751,168 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
         src_input.h += 1;
     }
 
-    GST_LOG_OBJECT( xvimagesink, "screen[%dx%d],window[%d,%d,%dx%d],method[%d],rotate[%d],zoom[%d],dp_mode[%d],src[%dx%d],dst[%d,%d,%dx%d],input[%d,%d,%dx%d],result[%d,%d,%dx%d]",
-      xvimagesink->scr_w, xvimagesink->scr_h,
-      xvimagesink->xwindow->x, xvimagesink->xwindow->y, xvimagesink->xwindow->width, xvimagesink->xwindow->height,
+    if (!xvimagesink->get_pixmap_cb) {
+      GST_LOG_OBJECT( xvimagesink, "screen[%dx%d],window[%d,%d,%dx%d],method[%d],rotate[%d],zoom[%f],dp_mode[%d],src[%dx%d],dst[%d,%d,%dx%d],input[%d,%d,%dx%d],result[%d,%d,%dx%d]",
+        xvimagesink->scr_w, xvimagesink->scr_h,
+        xvimagesink->xwindow->x, xvimagesink->xwindow->y, xvimagesink->xwindow->width, xvimagesink->xwindow->height,
+        xvimagesink->display_geometry_method, rotate, xvimagesink->zoom, xvimagesink->display_mode,
+        src_origin.w, src_origin.h,
+        dst.x, dst.y, dst.w, dst.h,
+        src_input.x, src_input.y, src_input.w, src_input.h,
+        result.x, result.y, result.w, result.h );
+    } else {
+      GST_LOG_OBJECT( xvimagesink, "pixmap[%d,%d,%dx%d],method[%d],rotate[%d],zoom[%f],dp_mode[%d],src[%dx%d],dst[%d,%d,%dx%d],input[%d,%d,%dx%d],result[%d,%d,%dx%d]",
+      xvimagesink->xpixmap[idx]->x, xvimagesink->xpixmap[idx]->y, xvimagesink->xpixmap[idx]->width, xvimagesink->xpixmap[idx]->height,
       xvimagesink->display_geometry_method, rotate, xvimagesink->zoom, xvimagesink->display_mode,
       src_origin.w, src_origin.h,
       dst.x, dst.y, dst.w, dst.h,
       src_input.x, src_input.y, src_input.w, src_input.h,
       result.x, result.y, result.w, result.h );
+    }
+    /* skip request to render if dst rect is 0 */
+    if (xvimagesink->is_zero_copy_format && (!result.w || !result.h)) {
+      GST_WARNING_OBJECT(xvimagesink, "result.w[%d] or result.h[%d] is 0. Skip xvimage_put.", result.w, result.h);
+      g_mutex_unlock(xvimagesink->x_lock);
+      g_mutex_unlock(xvimagesink->flow_lock);
+      return TRUE;
+    }
 
-    if (atom_rotation == None) {
-      atom_rotation = XInternAtom(xvimagesink->xcontext->disp,
+    static gboolean is_exist = FALSE;
+    gchar *attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_ROTATION");
+    is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+    g_free(attr_name);
+
+    if (is_exist) {
+      /* set display rotation */
+      if (atom_rotation == None) {
+        atom_rotation = XInternAtom(xvimagesink->xcontext->disp,
                                   "_USER_WM_PORT_ATTRIBUTE_ROTATION", False);
+      }
+      ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id,
+                               atom_rotation, rotate);
+      if (ret != Success) {
+        GST_ERROR_OBJECT( xvimagesink, "XvSetPortAttribute failed[%d]. disp[%x],xv_port_id[%d],atom[%x],rotate[%d]",
+          ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_rotation, rotate );
+
+        g_mutex_unlock(xvimagesink->x_lock);
+        g_mutex_unlock(xvimagesink->flow_lock);
+        return FALSE;
+      }
+    } else {
+      GST_WARNING("_USER_WM_PORT_ATTRIBUTE_ROTATION is not existed");
     }
 
-    ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_rotation, rotate);
-    if (ret != Success) {
-      GST_ERROR_OBJECT( xvimagesink, "XvSetPortAttribute failed[%d]. disp[%x],xv_port_id[%d],atom[%x],rotate[%d]",
-        ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_rotation, rotate );
-      return FALSE;
+    switch( xvimagesink->orientation )
+    {
+      case DEGREE_0:
+        orientation = 0;
+        break;
+      case DEGREE_90:
+        orientation = 90;
+        break;
+      case DEGREE_180:
+        orientation = 180;
+        break;
+      case DEGREE_270:
+        orientation = 270;
+        break;
+      default:
+        GST_WARNING_OBJECT( xvimagesink, "Unsupported orientation [%d]...",
+          xvimagesink->orientation );
+        break;
     }
+
+    is_exist = FALSE;
+    attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_CONTENTS_ROTATION");
+    is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+    g_free(attr_name);
+
+    if (is_exist) {
+      /* set contents rotation for connecting with external display */
+      if (atom_contents_rotation == None) {
+        atom_contents_rotation = XInternAtom(xvimagesink->xcontext->disp,
+                                 "_USER_WM_PORT_ATTRIBUTE_CONTENTS_ROTATION", False);
+      }
+      ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id,
+                               atom_contents_rotation, orientation);
+      if (ret != Success) {
+        GST_ERROR_OBJECT( xvimagesink, "XvSetPortAttribute failed[%d]. disp[%x],xv_port_id[%d],atom[%x],orientation[%d]",
+          ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_contents_rotation, orientation );
+
+        g_mutex_unlock(xvimagesink->x_lock);
+        g_mutex_unlock(xvimagesink->flow_lock);
+        return FALSE;
+      }
+    }else {
+      GST_WARNING("_USER_WM_PORT_ATTRIBUTE_CONTENTS_ROTATION is not existed");
+    }
+
+    switch (xvimagesink->flip) {
+    case FLIP_HORIZONTAL:
+      set_hflip = TRUE;
+      set_vflip = FALSE;
+      break;
+    case FLIP_VERTICAL:
+      set_hflip = FALSE;
+      set_vflip = TRUE;
+      break;
+    case FLIP_BOTH:
+      set_hflip = TRUE;
+      set_vflip = TRUE;
+      break;
+    case FLIP_NONE:
+    default:
+      set_hflip = FALSE;
+      set_vflip = FALSE;
+      break;
+    }
+
+    GST_LOG("set HFLIP %d, VFLIP %d", set_hflip, set_vflip);
+
+    is_exist = FALSE;
+    attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_HFLIP");
+    is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+    g_free(attr_name);
+
+    if (is_exist) {
+      if (atom_hflip == None) {
+        /* set display flip */
+        atom_hflip = XInternAtom(xvimagesink->xcontext->disp,
+                                 "_USER_WM_PORT_ATTRIBUTE_HFLIP", False);
+    }
+      ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_hflip, set_hflip);
+      if (ret != Success) {
+        GST_WARNING("set HFLIP failed[%d]. disp[%x],xv_port_id[%d],atom[%x],hflip[%d]",
+                    ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_hflip, set_hflip);
+      }
+    }
+
+    is_exist = FALSE;
+    attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_VFLIP");
+    is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+    g_free(attr_name);
+
+    if (is_exist) {
+      if (atom_vflip == None) {
+        /* set display flip */
+        atom_vflip = XInternAtom(xvimagesink->xcontext->disp,
+                                 "_USER_WM_PORT_ATTRIBUTE_VFLIP", False);
+       }
+      ret = XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_vflip, set_vflip);
+      if (ret != Success) {
+        GST_WARNING("set VFLIP failed[%d]. disp[%x],xv_port_id[%d],atom[%x],vflip[%d]",
+                    ret, xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_vflip, set_vflip);
+      }
+    }
+
+    /* set error handler */
+    error_caught = FALSE;
+    handler = XSetErrorHandler(gst_xvimagesink_handle_xerror);
 
     /* src input indicates the status when degree is 0 */
     /* dst input indicates the area that src will be shown regardless of rotate */
-
-    if (xvimagesink->visible && !xvimagesink->is_hided) {
+    if (xvimagesink->visible &&
+      ((!xvimagesink->is_hided) || (xvimagesink->is_hided && (GST_STATE(xvimagesink) == GST_STATE_PLAYING)))) {
       if (xvimagesink->xim_transparenter) {
         GST_LOG_OBJECT( xvimagesink, "Transparent related issue." );
         XPutImage(xvimagesink->xcontext->disp,
@@ -1269,13 +1923,39 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
           result.x, result.y, result.w, result.h);
       }
 
-      ret = XvShmPutImage (xvimagesink->xcontext->disp,
-        xvimagesink->xcontext->xv_port_id,
-        xvimagesink->xwindow->win,
-        xvimagesink->xwindow->gc, xvimage->xvimage,
-        src_input.x, src_input.y, src_input.w, src_input.h,
-        result.x, result.y, result.w, result.h, FALSE);
-      GST_LOG_OBJECT( xvimagesink, "XvShmPutImage return value [%d]", ret );
+      /* store buffer */
+      if (xvimagesink->is_zero_copy_format && xvimage->xvimage->data) {
+        img_data = (XV_DATA_PTR)xvimage->xvimage->data;
+        if (img_data->BufType == XV_BUF_TYPE_DMABUF) {
+          _add_displaying_buffer(xvimagesink, img_data, xvimage->current_buffer);
+          xvimage->current_buffer = NULL;
+        }
+      }
+
+      g_mutex_lock(xvimagesink->display_buffer_lock);
+      if (xvimagesink->displaying_buffer_count > 3) {
+        GST_WARNING("too many buffers are not released. [displaying_buffer_count %d]", xvimagesink->displaying_buffer_count);
+      }
+      g_mutex_unlock(xvimagesink->display_buffer_lock);
+
+      if (xvimagesink->get_pixmap_cb) {
+        gint idx = xvimagesink->current_pixmap_idx;
+        ret = XvShmPutImage (xvimagesink->xcontext->disp,
+          xvimagesink->xcontext->xv_port_id,
+          xvimagesink->xpixmap[idx]->pixmap,
+          xvimagesink->xpixmap[idx]->gc, xvimage->xvimage,
+          src_input.x, src_input.y, src_input.w, src_input.h,
+          result.x, result.y, result.w, result.h, FALSE);
+        GST_LOG_OBJECT( xvimagesink, "XvShmPutImage return value [%d], disp[0x%x], gc[0x%x], pixmap id[%d], idx[%d]", ret, xvimagesink->xcontext->disp, xvimagesink->xpixmap[idx]->gc, xvimagesink->xpixmap[idx]->pixmap, idx);
+      } else {
+        ret = XvShmPutImage (xvimagesink->xcontext->disp,
+          xvimagesink->xcontext->xv_port_id,
+          xvimagesink->xwindow->win,
+          xvimagesink->xwindow->gc, xvimage->xvimage,
+          src_input.x, src_input.y, src_input.w, src_input.h,
+          result.x, result.y, result.w, result.h, FALSE);
+        GST_LOG_OBJECT( xvimagesink, "XvShmPutImage return value [%d], disp[0x%x], gc[0x%x], xid[%d]", ret, xvimagesink->xcontext->disp, xvimagesink->xwindow->gc, xvimagesink->xwindow->win);
+      }
     } else {
       GST_LOG_OBJECT( xvimagesink, "visible is FALSE. skip this image..." );
     }
@@ -1301,6 +1981,42 @@ gst_xvimagesink_xvimage_put (GstXvImageSink * xvimagesink,
   }
 
   XSync (xvimagesink->xcontext->disp, FALSE);
+
+#ifdef HAVE_XSHM
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (ret || error_caught || xvimagesink->get_pixmap_cb) {
+    GST_DEBUG("error or pixmap_cb");
+
+    if (ret || error_caught) {
+      GST_WARNING("putimage error : ret %d, error_caught %d, pixmap cb %p, displaying buffer count %d",
+                  ret, error_caught, xvimagesink->get_pixmap_cb, xvimagesink->displaying_buffer_count);
+
+      if (xvimagesink->get_pixmap_cb) {
+        g_signal_emit (G_OBJECT (xvimagesink),
+                       gst_xvimagesink_signals[SIGNAL_FRAME_RENDER_ERROR],
+                       0,
+                       &xvimagesink->xpixmap[idx]->pixmap,
+                       &res);
+      }
+    }
+
+    /* release gem handle */
+    if (img_data && img_data->BufType == XV_BUF_TYPE_DMABUF) {
+      unsigned int gem_name[XV_BUF_PLANE_NUM] = { 0, };
+      gem_name[0] = img_data->YBuf;
+      gem_name[1] = img_data->CbBuf;
+      gem_name[2] = img_data->CrBuf;
+      _remove_displaying_buffer(xvimagesink, gem_name);
+    }
+  }
+
+  /* Reset error handler */
+  if (handler) {
+    error_caught = FALSE;
+    XSetErrorHandler (handler);
+  }
+#endif /* GST_EXT_XV_ENHANCEMENT */
+#endif /* HAVE_XSHM */
 
   g_mutex_unlock (xvimagesink->x_lock);
 
@@ -1390,27 +2106,29 @@ gst_xvimagesink_xwindow_set_title (GstXvImageSink * xvimagesink,
 #ifdef GST_EXT_XV_ENHANCEMENT
 static XImage *make_transparent_image(Display *d, Window win, int w, int h)
 {
-  XImage             *xim;
+  XImage *xim;
 
   /* create a normal ximage */
   xim = XCreateImage(d, DefaultVisualOfScreen(DefaultScreenOfDisplay(d)),  24, ZPixmap, 0, NULL, w, h, 32, 0);
 
+  GST_INFO("ximage %p", xim);
+
   /* allocate data for it */
   if (xim) {
     xim->data = (char *)malloc(xim->bytes_per_line * xim->height);
-  }
-
-  memset(xim->data, 0x00, xim->bytes_per_line * xim->height);
-  if (!xim || !xim->data) {
-    /* failed to create XImage or allocate data memory */
-    if (xim) {
-      XDestroyImage(xim);
+    if (xim->data) {
+      memset(xim->data, 0x00, xim->bytes_per_line * xim->height);
+      return xim;
+    } else {
+      GST_ERROR("failed to alloc data - size %d", xim->bytes_per_line * xim->height);
     }
 
-    return NULL;
+    XDestroyImage(xim);
   }
 
-  return xim;
+  GST_ERROR("failed to create Ximage");
+
+  return NULL;
 }
 
 
@@ -1433,19 +2151,24 @@ static gboolean set_display_mode(GstXContext *xcontext, int set_mode)
     int count = 0;
     XvAttribute *const attr = XvQueryPortAttributes(xcontext->disp,
                                                     xcontext->xv_port_id, &count);
-    is_exist = FALSE;
-    current_port_id = xcontext->xv_port_id;
-    for (i = 0 ; i < count ; i++) {
-      if (!strcmp(attr[i].name, "_USER_WM_PORT_ATTRIBUTE_OUTPUT")) {
-        is_exist = TRUE;
-        GST_INFO("_USER_WM_PORT_ATTRIBUTE_OUTPUT[index %d] found", i);
-        break;
+    if (attr) {
+      current_port_id = xcontext->xv_port_id;
+      for (i = 0 ; i < count ; i++) {
+        if (!strcmp(attr[i].name, "_USER_WM_PORT_ATTRIBUTE_OUTPUT")) {
+          is_exist = TRUE;
+          GST_INFO("_USER_WM_PORT_ATTRIBUTE_OUTPUT[index %d] found", i);
+          break;
+        }
       }
+      XFree(attr);
+    } else {
+      GST_WARNING("XvQueryPortAttributes disp:%d, port_id:%d failed",
+                  xcontext->disp, xcontext->xv_port_id);
     }
   }
 
   if (is_exist) {
-    GST_INFO("set display mode %d", set_mode);
+    GST_DEBUG("set display mode %d", set_mode);
     atom_output = XInternAtom(xcontext->disp,
                               "_USER_WM_PORT_ATTRIBUTE_OUTPUT", False);
     ret = XvSetPortAttribute(xcontext->disp, xcontext->xv_port_id,
@@ -1461,6 +2184,687 @@ static gboolean set_display_mode(GstXContext *xcontext, int set_mode)
 
   return FALSE;
 }
+
+
+static gboolean set_csc_range(GstXContext *xcontext, int set_range)
+{
+  int ret = 0;
+  static gboolean is_exist = FALSE;
+  static XvPortID current_port_id = -1;
+  Atom atom_csc_range = None;
+
+  if (xcontext == NULL) {
+    GST_WARNING("xcontext is NULL");
+    return FALSE;
+  }
+
+  /* check once per one xv_port_id */
+  if (current_port_id != xcontext->xv_port_id) {
+    /* check whether _USER_WM_PORT_ATTRIBUTE_OUTPUT attribute is existed */
+    int i = 0;
+    int count = 0;
+    XvAttribute *const attr = XvQueryPortAttributes(xcontext->disp,
+                                                    xcontext->xv_port_id, &count);
+    if (attr) {
+      current_port_id = xcontext->xv_port_id;
+      for (i = 0 ; i < count ; i++) {
+        if (!strcmp(attr[i].name, "_USER_WM_PORT_ATTRIBUTE_CSC_RANGE")) {
+          is_exist = TRUE;
+          GST_INFO("_USER_WM_PORT_ATTRIBUTE_OUTPUT[index %d] found", i);
+          break;
+        }
+      }
+      XFree(attr);
+    } else {
+      GST_WARNING("XvQueryPortAttributes disp:%d, port_id:%d failed",
+                  xcontext->disp, xcontext->xv_port_id);
+    }
+  }
+
+  if (is_exist) {
+    GST_WARNING("set csc range %d", set_range);
+    atom_csc_range = XInternAtom(xcontext->disp,
+                                 "_USER_WM_PORT_ATTRIBUTE_CSC_RANGE", False);
+    ret = XvSetPortAttribute(xcontext->disp, xcontext->xv_port_id,
+                             atom_csc_range, set_range);
+    if (ret == Success) {
+      return TRUE;
+    } else {
+      GST_WARNING("csc range[%d] set failed.", set_range);
+    }
+  } else {
+    GST_WARNING("_USER_WM_PORT_ATTRIBUTE_CSC_RANGE is not existed");
+  }
+
+  return FALSE;
+}
+
+
+static void drm_init(GstXvImageSink *xvimagesink)
+{
+	Display *dpy;
+	int eventBase = 0;
+	int errorBase = 0;
+	int dri2Major = 0;
+	int dri2Minor = 0;
+	char *driverName = NULL;
+	char *deviceName = NULL;
+	struct drm_auth auth_arg = {0};
+
+	xvimagesink->drm_fd = -1;
+
+	dpy = XOpenDisplay(0);
+	if (!dpy) {
+		GST_ERROR("XOpenDisplay failed errno:%d", errno);
+		return;
+	}
+
+	GST_INFO("START");
+
+	/* DRI2 */
+	if (!DRI2QueryExtension(dpy, &eventBase, &errorBase)) {
+		GST_ERROR("DRI2QueryExtension !!");
+		goto DRM_INIT_ERROR;
+	}
+
+	if (!DRI2QueryVersion(dpy, &dri2Major, &dri2Minor)) {
+		GST_ERROR("DRI2QueryVersion !!");
+		goto DRM_INIT_ERROR;
+	}
+
+	if (!DRI2Connect(dpy, RootWindow(dpy, DefaultScreen(dpy)), &driverName, &deviceName)) {
+		GST_ERROR("DRI2Connect !!");
+		goto DRM_INIT_ERROR;
+	}
+
+	if (!driverName || !deviceName) {
+		GST_ERROR("driverName or deviceName is not valid");
+		goto DRM_INIT_ERROR;
+	}
+
+	GST_INFO("Open drm device : %s", deviceName);
+
+	/* get the drm_fd though opening the deviceName */
+	xvimagesink->drm_fd = open(deviceName, O_RDWR);
+	if (xvimagesink->drm_fd < 0) {
+		GST_ERROR("cannot open drm device (%s)", deviceName);
+		goto DRM_INIT_ERROR;
+	}
+
+	/* get magic from drm to authentication */
+	if (ioctl(xvimagesink->drm_fd, DRM_IOCTL_GET_MAGIC, &auth_arg)) {
+		GST_ERROR("cannot get drm auth magic [drm fd %d]", xvimagesink->drm_fd);
+		goto DRM_INIT_ERROR;
+	}
+
+	if (!DRI2Authenticate(dpy, RootWindow(dpy, DefaultScreen(dpy)), auth_arg.magic)) {
+		GST_ERROR("cannot get drm authentication from X");
+		goto DRM_INIT_ERROR;
+	}
+
+	XCloseDisplay(dpy);
+	free(driverName);
+	free(deviceName);
+
+	xvimagesink->bufmgr = tbm_bufmgr_init(xvimagesink->drm_fd);
+	if (xvimagesink->bufmgr == NULL) {
+		GST_ERROR_OBJECT(xvimagesink, "tbm_bufmgr_init failed");
+		goto DRM_INIT_ERROR;
+	}
+
+	GST_INFO("DONE");
+
+	return;
+
+DRM_INIT_ERROR:
+	if (xvimagesink->drm_fd >= 0) {
+		close(xvimagesink->drm_fd);
+		xvimagesink->drm_fd = -1;
+	}
+	if (dpy) {
+		XCloseDisplay(dpy);
+	}
+	if (driverName) {
+		free(driverName);
+	}
+	if (deviceName) {
+		free(deviceName);
+	}
+
+	return;
+}
+
+static void drm_fini(GstXvImageSink *xvimagesink)
+{
+	GST_WARNING_OBJECT(xvimagesink, "START");
+
+	if (xvimagesink->drm_fd >= 0) {
+		int i = 0;
+		int j = 0;
+
+		/* close remained gem handle */
+		g_mutex_lock(xvimagesink->display_buffer_lock);
+		for (i = 0 ; i < DISPLAYING_BUFFERS_MAX_NUM ; i++) {
+			if (xvimagesink->displaying_buffers[i].gem_name[0] > 0) {
+				GST_WARNING_OBJECT(xvimagesink, "remained buffer %p, name %u %u %u, handle %u %u %u",
+				            xvimagesink->displaying_buffers[i].buffer,
+				            xvimagesink->displaying_buffers[i].gem_name[0],
+				            xvimagesink->displaying_buffers[i].gem_name[1],
+				            xvimagesink->displaying_buffers[i].gem_name[2],
+				            xvimagesink->displaying_buffers[i].gem_handle[0],
+				            xvimagesink->displaying_buffers[i].gem_handle[1],
+				            xvimagesink->displaying_buffers[i].gem_handle[2]);
+
+				/* release flush buffer */
+				if (xvimagesink->flush_buffer) {
+					if (xvimagesink->flush_buffer->gem_name[0] == xvimagesink->displaying_buffers[i].gem_name[0] &&
+					    xvimagesink->flush_buffer->gem_name[1] == xvimagesink->displaying_buffers[i].gem_name[1] &&
+					    xvimagesink->flush_buffer->gem_name[2] == xvimagesink->displaying_buffers[i].gem_name[2]) {
+						_release_flush_buffer(xvimagesink);
+					}
+				} else {
+					GST_WARNING_OBJECT(xvimagesink, "Force Unref buffer");
+				}
+
+				for (j = 0 ; j < XV_BUF_PLANE_NUM ; j++) {
+					if (xvimagesink->displaying_buffers[i].gem_handle[j] > 0) {
+						drm_close_gem(xvimagesink, &(xvimagesink->displaying_buffers[i].gem_handle[j]));
+					}
+					xvimagesink->displaying_buffers[i].gem_name[j] = 0;
+					xvimagesink->displaying_buffers[i].dmabuf_fd[j] = 0;
+					xvimagesink->displaying_buffers[i].bo[j] = NULL;
+				}
+
+				if (xvimagesink->displaying_buffers[i].buffer) {
+					gst_buffer_unref(xvimagesink->displaying_buffers[i].buffer);
+					xvimagesink->displaying_buffers[i].buffer = NULL;
+				}
+			}
+		}
+		g_mutex_unlock(xvimagesink->display_buffer_lock);
+
+		GST_WARNING_OBJECT(xvimagesink, "destroy tbm buffer manager");
+		tbm_bufmgr_deinit(xvimagesink->bufmgr);
+		xvimagesink->bufmgr = NULL;
+
+		GST_WARNING_OBJECT(xvimagesink, "close drm_fd %d", xvimagesink->drm_fd);
+		close(xvimagesink->drm_fd);
+		xvimagesink->drm_fd = -1;
+	} else {
+		GST_WARNING_OBJECT(xvimagesink, "DRM device is NOT opened");
+	}
+
+	GST_WARNING_OBJECT(xvimagesink, "DONE");
+}
+
+static unsigned int drm_convert_dmabuf_gemname(GstXvImageSink *xvimagesink, unsigned int dmabuf_fd, unsigned int *gem_handle)
+{
+	int ret = 0;
+
+	struct drm_prime_handle prime_arg = {0,};
+	struct drm_gem_flink flink_arg = {0,};
+
+	if (!xvimagesink || !gem_handle) {
+		GST_ERROR("handle[%p,%p] is NULL", xvimagesink, gem_handle);
+		return 0;
+	}
+
+	if (xvimagesink->drm_fd < 0) {
+		GST_ERROR("DRM is not opened");
+		return 0;
+	}
+
+	if (dmabuf_fd <= 0) {
+		GST_LOG("Ignore wrong dmabuf fd [%u]", dmabuf_fd);
+		return 0;
+	}
+
+	prime_arg.fd = dmabuf_fd;
+	ret = ioctl(xvimagesink->drm_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime_arg);
+	if (ret) {
+		GST_ERROR("DRM_IOCTL_PRIME_FD_TO_HANDLE failed. ret %d, dmabuf fd : %u [drm fd %d]",
+		          ret, dmabuf_fd, xvimagesink->drm_fd);
+		return 0;
+	}
+
+	*gem_handle = prime_arg.handle;
+	flink_arg.handle = prime_arg.handle;
+	ret = ioctl(xvimagesink->drm_fd, DRM_IOCTL_GEM_FLINK, &flink_arg);
+	if (ret) {
+		GST_ERROR("DRM_IOCTL_GEM_FLINK failed. ret %d, gem_handle %u, gem_name %u [drm fd %d]",
+		          ret, *gem_handle, flink_arg.name, xvimagesink->drm_fd);
+		return 0;
+	}
+
+	return flink_arg.name;
+}
+
+static void drm_close_gem(GstXvImageSink *xvimagesink, unsigned int *gem_handle)
+{
+	struct drm_gem_close close_arg = {0,};
+
+	if (xvimagesink->drm_fd < 0 || !gem_handle) {
+		GST_ERROR("DRM is not opened");
+		return;
+	}
+
+	if (*gem_handle <= 0) {
+		GST_DEBUG("invalid gem handle %u", *gem_handle);
+		return;
+	}
+
+	GST_LOG("Call DRM_IOCTL_GEM_CLOSE - handle %u", *gem_handle);
+
+	close_arg.handle = *gem_handle;
+	if (ioctl(xvimagesink->drm_fd, DRM_IOCTL_GEM_CLOSE, &close_arg)) {
+		GST_ERROR("cannot close drm gem handle %u [drm fd %d]", *gem_handle, xvimagesink->drm_fd);
+		return;
+	}
+
+	*gem_handle = 0;
+
+	return;
+}
+
+
+static void _remove_last_buffer(GstXvImageSink *xvimagesink)
+{
+  gboolean enable_last_buffer = FALSE;
+
+  if (xvimagesink == NULL) {
+    GST_ERROR("handle is NULL");
+    return;
+  }
+
+  /* get enable-last-buffer */
+  g_object_get(G_OBJECT(xvimagesink), "enable-last-buffer", &enable_last_buffer, NULL);
+
+  GST_WARNING_OBJECT(xvimagesink, "current enable-last-buffer : %d", enable_last_buffer);
+
+  /* flush if enable-last-buffer is TRUE */
+  if (enable_last_buffer) {
+    g_object_set(G_OBJECT(xvimagesink), "enable-last-buffer", FALSE, NULL);
+    g_object_set(G_OBJECT(xvimagesink), "enable-last-buffer", TRUE, NULL);
+  }
+
+  return;
+}
+
+
+static void _release_flush_buffer(GstXvImageSink *xvimagesink)
+{
+	int i = 0;
+
+	if (xvimagesink == NULL ||
+	    xvimagesink->flush_buffer == NULL) {
+		GST_WARNING("handle is NULL");
+		return;
+	}
+
+	GST_WARNING_OBJECT(xvimagesink, "release FLUSH BUFFER");
+
+	for (i = 0 ; i < XV_BUF_PLANE_NUM ; i++) {
+		if (xvimagesink->flush_buffer->bo[i]) {
+			tbm_bo_unref(xvimagesink->flush_buffer->bo[i]);
+			xvimagesink->flush_buffer->bo[i] = NULL;
+		}
+	}
+
+	GST_WARNING_OBJECT(xvimagesink, "release FLUSH BUFFER done");
+
+	free(xvimagesink->flush_buffer);
+	xvimagesink->flush_buffer = NULL;
+
+	return;
+}
+
+
+static void _add_displaying_buffer(GstXvImageSink *xvimagesink, XV_DATA_PTR img_data, GstBuffer *buffer)
+{
+	int i = 0;
+	int j = 0;
+
+	if (!xvimagesink || !img_data) {
+		GST_ERROR("handle is NULL %p, %p", xvimagesink, img_data);
+		return;
+	}
+
+	/* lock display buffer mutex */
+	g_mutex_lock(xvimagesink->display_buffer_lock);
+
+	/* increase displaying buffer count */
+	xvimagesink->displaying_buffer_count++;
+
+	/* check duplicated */
+	for (i = 0 ; i < DISPLAYING_BUFFERS_MAX_NUM ; i++) {
+		if (xvimagesink->displaying_buffers[i].gem_name[0] > 0) {
+			if ((img_data->dmabuf_fd[0] > 0 &&
+			     xvimagesink->displaying_buffers[i].dmabuf_fd[0] == img_data->dmabuf_fd[0] &&
+			     xvimagesink->displaying_buffers[i].dmabuf_fd[1] == img_data->dmabuf_fd[1] &&
+			     xvimagesink->displaying_buffers[i].dmabuf_fd[2] == img_data->dmabuf_fd[2]) ||
+			    (img_data->bo[0] &&
+			     xvimagesink->displaying_buffers[i].bo[0] == img_data->bo[0] &&
+			     xvimagesink->displaying_buffers[i].bo[1] == img_data->bo[1] &&
+			     xvimagesink->displaying_buffers[i].bo[2] == img_data->bo[2])) {
+				/* increase ref count */
+				xvimagesink->displaying_buffers[i].ref_count++;
+
+				/* set buffer info */
+				img_data->YBuf = xvimagesink->displaying_buffers[i].gem_name[0];
+				img_data->CbBuf = xvimagesink->displaying_buffers[i].gem_name[1];
+				img_data->CrBuf = xvimagesink->displaying_buffers[i].gem_name[2];
+
+				if (img_data->dmabuf_fd[0] > 0) {
+					GST_WARNING("already converted fd [%u %u %u] name [%u %u %u]",
+					            img_data->dmabuf_fd[0], img_data->dmabuf_fd[1], img_data->dmabuf_fd[2],
+					            img_data->YBuf, img_data->CbBuf, img_data->CrBuf);
+				} else {
+					GST_WARNING("already exported bo [%p %p %p] gem name [%u %u %u]",
+					            img_data->bo[0], img_data->bo[1], img_data->bo[2],
+					            img_data->YBuf, img_data->CbBuf, img_data->CrBuf);
+				}
+
+				/* unlock display buffer mutex */
+				g_mutex_unlock(xvimagesink->display_buffer_lock);
+				return;
+			}
+		}
+	}
+
+	/* store buffer temporarily */
+	for (i = 0 ; i < DISPLAYING_BUFFERS_MAX_NUM ; i++) {
+		if (xvimagesink->displaying_buffers[i].gem_name[0] == 0) {
+			if (buffer) {
+				/* increase ref count of buffer */
+				gst_buffer_ref(buffer);
+				xvimagesink->displaying_buffers[i].buffer = buffer;
+			}
+
+			if (img_data->dmabuf_fd[0] > 0) {
+				/* convert fd to name */
+				img_data->YBuf = drm_convert_dmabuf_gemname(xvimagesink, img_data->dmabuf_fd[0], &img_data->gem_handle[0]);
+				img_data->CbBuf = drm_convert_dmabuf_gemname(xvimagesink, img_data->dmabuf_fd[1], &img_data->gem_handle[1]);
+				img_data->CrBuf = drm_convert_dmabuf_gemname(xvimagesink, img_data->dmabuf_fd[2], &img_data->gem_handle[2]);
+			} else {
+				/* export bo */
+				if (img_data->bo[0]) {
+					img_data->YBuf = tbm_bo_export(img_data->bo[0]);
+				}
+				if (img_data->bo[1]) {
+					img_data->CbBuf = tbm_bo_export(img_data->bo[1]);
+				}
+				if (img_data->bo[2]) {
+					img_data->CrBuf = tbm_bo_export(img_data->bo[2]);
+				}
+			}
+
+			for (j = 0 ; j < XV_BUF_PLANE_NUM ; j++) {
+				xvimagesink->displaying_buffers[i].dmabuf_fd[j] = img_data->dmabuf_fd[j];
+				xvimagesink->displaying_buffers[i].gem_handle[j] = img_data->gem_handle[j];
+				xvimagesink->displaying_buffers[i].bo[j] = img_data->bo[j];
+			}
+
+			/* set buffer info */
+			xvimagesink->displaying_buffers[i].gem_name[0] = img_data->YBuf;
+			xvimagesink->displaying_buffers[i].gem_name[1] = img_data->CbBuf;
+			xvimagesink->displaying_buffers[i].gem_name[2] = img_data->CrBuf;
+
+			/* set ref count */
+			xvimagesink->displaying_buffers[i].ref_count = 1;
+
+			if (xvimagesink->displayed_buffer_count < _CHECK_DISPLAYED_BUFFER_COUNT) {
+				GST_WARNING_OBJECT(xvimagesink, "cnt %d - add idx %d, buf %p, fd [%u %u %u], handle [%u %u %u], name [%u %u %u]",
+				                                xvimagesink->displayed_buffer_count,
+				                                i, xvimagesink->displaying_buffers[i].buffer,
+				                                xvimagesink->displaying_buffers[i].dmabuf_fd[0],
+				                                xvimagesink->displaying_buffers[i].dmabuf_fd[1],
+				                                xvimagesink->displaying_buffers[i].dmabuf_fd[2],
+				                                xvimagesink->displaying_buffers[i].gem_handle[0],
+				                                xvimagesink->displaying_buffers[i].gem_handle[1],
+				                                xvimagesink->displaying_buffers[i].gem_handle[2],
+				                                xvimagesink->displaying_buffers[i].gem_name[0],
+				                                xvimagesink->displaying_buffers[i].gem_name[1],
+				                                xvimagesink->displaying_buffers[i].gem_name[2]);
+			} else {
+				GST_DEBUG_OBJECT(xvimagesink, "add idx %d, buf %p, fd [%u %u %u], handle [%u %u %u], name [%u %u %u]",
+				                              i, xvimagesink->displaying_buffers[i].buffer,
+				                              xvimagesink->displaying_buffers[i].dmabuf_fd[0],
+				                              xvimagesink->displaying_buffers[i].dmabuf_fd[1],
+				                              xvimagesink->displaying_buffers[i].dmabuf_fd[2],
+				                              xvimagesink->displaying_buffers[i].gem_handle[0],
+				                              xvimagesink->displaying_buffers[i].gem_handle[1],
+				                              xvimagesink->displaying_buffers[i].gem_handle[2],
+				                              xvimagesink->displaying_buffers[i].gem_name[0],
+				                              xvimagesink->displaying_buffers[i].gem_name[1],
+				                              xvimagesink->displaying_buffers[i].gem_name[2]);
+			}
+
+			/* set last added buffer index */
+			xvimagesink->last_added_buffer_index = i;
+			GST_LOG_OBJECT(xvimagesink, "xvimagesink->last_added_buffer_index %d", i);
+
+			/* unlock display buffer mutex */
+			g_mutex_unlock(xvimagesink->display_buffer_lock);
+
+			/* get current time */
+			gettimeofday(&xvimagesink->request_time[i], NULL);
+			return;
+		}
+	}
+
+	/* decrease displaying buffer count */
+	xvimagesink->displaying_buffer_count--;
+
+	/* unlock display buffer mutex */
+	g_mutex_unlock(xvimagesink->display_buffer_lock);
+
+	GST_ERROR("should not be reached here. buffer slot is FULL...");
+
+	return;
+}
+
+
+static void _remove_displaying_buffer(GstXvImageSink *xvimagesink, unsigned int *gem_name)
+{
+	int i = 0;
+	int j = 0;
+
+	if (!xvimagesink || !gem_name) {
+		GST_ERROR_OBJECT(xvimagesink, "handle is NULL %p, %p", xvimagesink, gem_name);
+		return;
+	}
+
+	/* lock display buffer mutex */
+	g_mutex_lock(xvimagesink->display_buffer_lock);
+
+	if (xvimagesink->displaying_buffer_count == 0) {
+		GST_WARNING_OBJECT(xvimagesink, "there is no displaying buffer");
+		/* unlock display buffer mutex */
+		g_mutex_unlock(xvimagesink->display_buffer_lock);
+		return;
+	}
+
+	GST_DEBUG_OBJECT(xvimagesink, "gem name [%u %u %u], displaying buffer count %d",
+	          gem_name[0], gem_name[1], gem_name[2],
+	          xvimagesink->displaying_buffer_count);
+
+	for (i = 0 ; i < DISPLAYING_BUFFERS_MAX_NUM ; i++) {
+		if (xvimagesink->displaying_buffers[i].gem_name[0] == gem_name[0] &&
+		    xvimagesink->displaying_buffers[i].gem_name[1] == gem_name[1] &&
+		    xvimagesink->displaying_buffers[i].gem_name[2] == gem_name[2]) {
+			struct timeval current_time;
+
+			/* get current time to calculate displaying time */
+			gettimeofday(&current_time, NULL);
+
+			GST_DEBUG_OBJECT(xvimagesink, "buffer return time %8d us",
+			                              (current_time.tv_sec - xvimagesink->request_time[i].tv_sec)*1000000 + \
+			                              (current_time.tv_usec - xvimagesink->request_time[i].tv_usec));
+
+			if (xvimagesink->displayed_buffer_count < _CHECK_DISPLAYED_BUFFER_COUNT) {
+				xvimagesink->displayed_buffer_count++;
+				GST_WARNING_OBJECT(xvimagesink, "cnt %d - remove idx %d, buf %p, handle [%u %u %u], name [%u %u %u]",
+				                                xvimagesink->displayed_buffer_count,
+				                                i, xvimagesink->displaying_buffers[i].buffer,
+				                                xvimagesink->displaying_buffers[i].gem_handle[0],
+				                                xvimagesink->displaying_buffers[i].gem_handle[1],
+				                                xvimagesink->displaying_buffers[i].gem_handle[2],
+				                                xvimagesink->displaying_buffers[i].gem_name[0],
+				                                xvimagesink->displaying_buffers[i].gem_name[1],
+				                                xvimagesink->displaying_buffers[i].gem_name[2]);
+			} else {
+				GST_DEBUG_OBJECT(xvimagesink, "remove idx %d, buf %p, handle [%u %u %u], name [%u %u %u]",
+				                              i, xvimagesink->displaying_buffers[i].buffer,
+				                              xvimagesink->displaying_buffers[i].gem_handle[0],
+				                              xvimagesink->displaying_buffers[i].gem_handle[1],
+				                              xvimagesink->displaying_buffers[i].gem_handle[2],
+				                              xvimagesink->displaying_buffers[i].gem_name[0],
+				                              xvimagesink->displaying_buffers[i].gem_name[1],
+				                              xvimagesink->displaying_buffers[i].gem_name[2]);
+			}
+
+			/* decrease displaying buffer count */
+			xvimagesink->displaying_buffer_count--;
+
+			/* decrease ref count */
+			xvimagesink->displaying_buffers[i].ref_count--;
+
+			if (xvimagesink->displaying_buffers[i].ref_count > 0) {
+				GST_WARNING("ref count not zero[%d], skip close gem handle",
+				            xvimagesink->displaying_buffers[i].ref_count);
+				break;
+			}
+
+			/* release flush buffer */
+			if (xvimagesink->flush_buffer) {
+				if (xvimagesink->flush_buffer->gem_name[0] == gem_name[0] &&
+				    xvimagesink->flush_buffer->gem_name[1] == gem_name[1] &&
+				    xvimagesink->flush_buffer->gem_name[2] == gem_name[2]) {
+					_release_flush_buffer(xvimagesink);
+				}
+			}
+
+			for (j = 0 ; j < XV_BUF_PLANE_NUM ; j++) {
+				if (xvimagesink->displaying_buffers[i].gem_handle[j] > 0) {
+					drm_close_gem(xvimagesink, &(xvimagesink->displaying_buffers[i].gem_handle[j]));
+				}
+				xvimagesink->displaying_buffers[i].gem_name[j] = 0;
+				xvimagesink->displaying_buffers[i].dmabuf_fd[j] = 0;
+				xvimagesink->displaying_buffers[i].bo[j] = NULL;
+			}
+
+			/* reset last_added_buffer_index */
+			if (xvimagesink->displaying_buffer_count < 1) {
+				xvimagesink->last_added_buffer_index = -1;
+				GST_DEBUG_OBJECT(xvimagesink, "displaying_buffer_count %d",
+				                                xvimagesink->displaying_buffer_count);
+			}
+
+			if (xvimagesink->displaying_buffers[i].buffer) {
+				gst_buffer_unref(xvimagesink->displaying_buffers[i].buffer);
+				xvimagesink->displaying_buffers[i].buffer = NULL;
+			} else {
+				GST_WARNING("no buffer to unref");
+			}
+			break;
+		}
+	}
+
+	/* unlock display buffer mutex */
+	g_mutex_unlock(xvimagesink->display_buffer_lock);
+
+	return;
+}
+
+
+static int _is_connected_to_external_display(GstXvImageSink *xvimagesink)
+{
+  Atom type_ret = 0;
+  int i = 0;
+  int ret = 0;
+  int size_ret = 0;
+  unsigned long num_ret = 0;
+  unsigned long bytes = 0;
+  unsigned char *prop_ret = NULL;
+  unsigned int data = 0;
+  int (*handler) (Display *, XErrorEvent *) = NULL;
+  Atom atom_output_external;
+
+  atom_output_external = XInternAtom(xvimagesink->xcontext->disp,
+                                       "XV_OUTPUT_EXTERNAL", False);
+  if (atom_output_external != None) {
+    /* set error handler */
+    error_caught = FALSE;
+    handler = XSetErrorHandler(gst_xvimagesink_handle_xerror);
+
+    ret = XGetWindowProperty(xvimagesink->xcontext->disp,
+                             xvimagesink->xwindow->win,
+                             atom_output_external, 0, 0x7fffffff,
+                             False, XA_CARDINAL, &type_ret, &size_ret,
+                             &num_ret, &bytes, &prop_ret);
+    XSync(xvimagesink->xcontext->disp, FALSE);
+    if (ret != Success || error_caught) {
+      GST_WARNING_OBJECT(xvimagesink, "XGetWindowProperty failed");
+      if (prop_ret) {
+        XFree(prop_ret);
+      }
+      if (error_caught) {
+        GST_WARNING_OBJECT(xvimagesink, "error caught in XGetWindowProperty()");
+      }
+      if (handler) {
+        error_caught = FALSE;
+        XSetErrorHandler (handler);
+      }
+      return False;
+    }
+
+    if (handler) {
+      error_caught = FALSE;
+      XSetErrorHandler (handler);
+    }
+
+    if (!num_ret) {
+      GST_WARNING_OBJECT(xvimagesink, "XGetWindowProperty num_ret failed");
+      if (prop_ret) {
+        XFree(prop_ret);
+      }
+      return False;
+    }
+
+    if (prop_ret) {
+      switch (size_ret) {
+      case 8:
+        for (i = 0 ; i < num_ret ; i++) {
+          (&data)[i] = prop_ret[i];
+        }
+        break;
+      case 16:
+        for (i = 0 ; i < num_ret ; i++) {
+          ((unsigned short *)&data)[i] = ((unsigned short *)prop_ret)[i];
+        }
+        break;
+      case 32:
+        for (i = 0 ; i < num_ret ; i++) {
+          ((unsigned int *)&data)[i] = ((unsigned long *)prop_ret)[i];
+        }
+        break;
+      }
+      XFree(prop_ret);
+      prop_ret = NULL;
+
+      GST_WARNING_OBJECT(xvimagesink, "external display %d", data);
+
+      return (int)data;
+    } else {
+      GST_WARNING_OBJECT(xvimagesink, "prop_ret is NULL");
+      return False;
+    }
+  } else {
+    GST_WARNING_OBJECT(xvimagesink, "get XV_OUTPUT_EXTERNAL atom failed");
+  }
+
+  return False;
+}
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
 /* This function handles a GstXWindow creation
@@ -1473,7 +2877,7 @@ gst_xvimagesink_xwindow_new (GstXvImageSink * xvimagesink,
   XGCValues values;
 #ifdef GST_EXT_XV_ENHANCEMENT
   XSetWindowAttributes win_attr;
-  XWindowAttributes root_attr;
+  XWindowAttributes root_attr = {0 , };
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   g_return_val_if_fail (GST_IS_XVIMAGESINK (xvimagesink), NULL);
@@ -1492,7 +2896,8 @@ gst_xvimagesink_xwindow_new (GstXvImageSink * xvimagesink,
     xvimagesink->render_rect.h = xwindow->height = width;
   }
 
-  XGetWindowAttributes(xvimagesink->xcontext->disp, xvimagesink->xcontext->root, &root_attr);
+  if(!xvimagesink->is_pixmap)
+    XGetWindowAttributes(xvimagesink->xcontext->disp, xvimagesink->xcontext->root, &root_attr);
 
   if (xwindow->width > root_attr.width) {
     GST_INFO_OBJECT(xvimagesink, "Width[%d] is bigger than Max width. Set Max[%d].",
@@ -1521,7 +2926,8 @@ gst_xvimagesink_xwindow_new (GstXvImageSink * xvimagesink,
 
   /* Make window manager not to change window size as Full screen */
   win_attr.override_redirect = True;
-  XChangeWindowAttributes(xvimagesink->xcontext->disp, xwindow->win, CWOverrideRedirect, &win_attr);
+  if(!xvimagesink->is_pixmap)
+    XChangeWindowAttributes(xvimagesink->xcontext->disp, xwindow->win, CWOverrideRedirect, &win_attr);
 #else /* GST_EXT_XV_ENHANCEMENT */
   xvimagesink->render_rect.w = width;
   xvimagesink->render_rect.h = height;
@@ -1546,10 +2952,17 @@ gst_xvimagesink_xwindow_new (GstXvImageSink * xvimagesink,
 
   if (xvimagesink->handle_events) {
     Atom wm_delete;
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+    XSelectInput (xvimagesink->xcontext->disp, xvimagesink->xcontext->root, StructureNotifyMask | SubstructureNotifyMask);
+    XSelectInput (xvimagesink->xcontext->disp, xwindow->win, ExposureMask |
+         StructureNotifyMask | PointerMotionMask | KeyPressMask |
+         KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PropertyChangeMask);
+#else
     XSelectInput (xvimagesink->xcontext->disp, xwindow->win, ExposureMask |
         StructureNotifyMask | PointerMotionMask | KeyPressMask |
         KeyReleaseMask | ButtonPressMask | ButtonReleaseMask);
+#endif
+
 
     /* Tell the window manager we'd like delete client messages instead of
      * being killed */
@@ -1607,12 +3020,35 @@ gst_xvimagesink_xwindow_destroy (GstXvImageSink * xvimagesink,
   g_free (xwindow);
 }
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+/* This function destroys a GstXWindow */
+static void
+gst_xvimagesink_xpixmap_destroy (GstXvImageSink * xvimagesink,
+    GstXPixmap * xpixmap)
+{
+  g_return_if_fail (xpixmap != NULL);
+  g_return_if_fail (GST_IS_XVIMAGESINK (xvimagesink));
+
+  g_mutex_lock (xvimagesink->x_lock);
+
+  XSelectInput (xvimagesink->xcontext->disp, xpixmap->pixmap, 0);
+
+  XFreeGC (xvimagesink->xcontext->disp, xpixmap->gc);
+
+  XSync (xvimagesink->xcontext->disp, FALSE);
+
+  g_mutex_unlock (xvimagesink->x_lock);
+
+  g_free (xpixmap);
+}
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
 static void
 gst_xvimagesink_xwindow_update_geometry (GstXvImageSink * xvimagesink)
 {
 #ifdef GST_EXT_XV_ENHANCEMENT
   Window root_window, child_window;
-  XWindowAttributes root_attr;
+  XWindowAttributes root_attr = {0 , };
 
   int cur_win_x = 0;
   int cur_win_y = 0;
@@ -1644,18 +3080,21 @@ gst_xvimagesink_xwindow_update_geometry (GstXvImageSink * xvimagesink)
   xvimagesink->xwindow->height = cur_win_height;
 
   /* Get absolute coordinates of current window */
-  XTranslateCoordinates( xvimagesink->xcontext->disp,
-    xvimagesink->xwindow->win,
-    root_window,
-    0, 0,
-    &cur_win_x, &cur_win_y, // relative x, y to root window == absolute x, y
-    &child_window );
+  if(!xvimagesink->is_pixmap) {
+    XTranslateCoordinates( xvimagesink->xcontext->disp,
+      xvimagesink->xwindow->win,
+      root_window,
+      0, 0,
+      &cur_win_x, &cur_win_y, // relative x, y to root window == absolute x, y
+      &child_window );
+  }
 
   xvimagesink->xwindow->x = cur_win_x;
   xvimagesink->xwindow->y = cur_win_y;
 
   /* Get size of root window == size of screen */
-  XGetWindowAttributes(xvimagesink->xcontext->disp, root_window, &root_attr);
+  if(!xvimagesink->is_pixmap)
+    XGetWindowAttributes(xvimagesink->xcontext->disp, root_window, &root_attr);
 
   xvimagesink->scr_w = root_attr.width;
   xvimagesink->scr_h = root_attr.height;
@@ -1664,6 +3103,16 @@ gst_xvimagesink_xwindow_update_geometry (GstXvImageSink * xvimagesink)
     xvimagesink->render_rect.x = xvimagesink->render_rect.y = 0;
     xvimagesink->render_rect.w = cur_win_width;
     xvimagesink->render_rect.h = cur_win_height;
+  }
+  if (xvimagesink->scr_w != xvimagesink->xwindow->width ||
+    xvimagesink->scr_h != xvimagesink->xwindow->height) {
+    xvimagesink->is_multi_window = TRUE;
+    g_signal_emit_by_name(G_OBJECT (xvimagesink), "multiwindow-active", xvimagesink->is_multi_window);
+    GST_INFO_OBJECT(xvimagesink, "It may be multi-window scenario");
+  } else {
+    xvimagesink->is_multi_window = FALSE;
+    g_signal_emit_by_name(G_OBJECT (xvimagesink), "multiwindow-active", xvimagesink->is_multi_window);
+    GST_INFO_OBJECT(xvimagesink, "It may be full-window scenario");
   }
 
   GST_LOG_OBJECT(xvimagesink, "screen size %dx%d, current window geometry %d,%d,%dx%d, render_rect %d,%d,%dx%d",
@@ -1693,14 +3142,24 @@ static void
 gst_xvimagesink_xwindow_clear (GstXvImageSink * xvimagesink,
     GstXWindow * xwindow)
 {
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (xvimagesink->is_subpicture_format)
+    return;
+#endif
   g_return_if_fail (xwindow != NULL);
   g_return_if_fail (GST_IS_XVIMAGESINK (xvimagesink));
 
   g_mutex_lock (xvimagesink->x_lock);
+#ifdef GST_EXT_XV_ENHANCEMENT
+  GST_WARNING_OBJECT(xvimagesink, "CALL XvStopVideo");
+#endif /* GST_EXT_XV_ENHANCEMENT */
 
   XvStopVideo (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id,
       xwindow->win);
-#ifndef GST_EXT_XV_ENHANCEMENT
+#ifdef GST_EXT_XV_ENHANCEMENT
+#if 0
+  /* NOTE : it should be enabled in pixmap buffer case,
+            if we can check whether if it is a pixmap or a window by X API */
   /* Preview area is not updated before other UI is updated in the screen. */
   XSetForeground (xvimagesink->xcontext->disp, xwindow->gc,
       xvimagesink->xcontext->black);
@@ -1708,6 +3167,7 @@ gst_xvimagesink_xwindow_clear (GstXvImageSink * xvimagesink,
   XFillRectangle (xvimagesink->xcontext->disp, xwindow->win, xwindow->gc,
       xvimagesink->render_rect.x, xvimagesink->render_rect.y,
       xvimagesink->render_rect.w, xvimagesink->render_rect.h);
+#endif
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   XSync (xvimagesink->xcontext->disp, FALSE);
@@ -1798,12 +3258,21 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
 
   g_return_if_fail (GST_IS_XVIMAGESINK (xvimagesink));
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  GST_LOG("check x event");
+  Atom sc_status_atom = XInternAtom (xvimagesink->xcontext->disp, STR_ATOM_SCRNCONF_STATUS, FALSE);
+  Atom external_atom = XInternAtom (xvimagesink->xcontext->disp, "XV_OUTPUT_EXTERNAL", FALSE);
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
   /* Handle Interaction, produces navigation events */
 
   /* We get all pointer motion events, only the last position is
      interesting. */
   g_mutex_lock (xvimagesink->flow_lock);
   g_mutex_lock (xvimagesink->x_lock);
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (xvimagesink->xcontext->disp) {
+#endif //GST_EXT_XV_ENHANCEMENT
   while (XCheckWindowEvent (xvimagesink->xcontext->disp,
           xvimagesink->xwindow->win, PointerMotionMask, &e)) {
     g_mutex_unlock (xvimagesink->x_lock);
@@ -1821,6 +3290,9 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
     g_mutex_lock (xvimagesink->flow_lock);
     g_mutex_lock (xvimagesink->x_lock);
   }
+#ifdef GST_EXT_XV_ENHANCEMENT
+  }
+#endif //GST_EXT_XV_ENHANCEMENT
   if (pointer_moved) {
     g_mutex_unlock (xvimagesink->x_lock);
     g_mutex_unlock (xvimagesink->flow_lock);
@@ -1891,7 +3363,6 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
     g_mutex_lock (xvimagesink->flow_lock);
     g_mutex_lock (xvimagesink->x_lock);
   }
-
   /* Handle Expose */
   while (XCheckWindowEvent (xvimagesink->xcontext->disp,
           xvimagesink->xwindow->win, ExposureMask | StructureNotifyMask, &e)) {
@@ -1902,9 +3373,12 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
       case ConfigureNotify:
         g_mutex_unlock (xvimagesink->x_lock);
 #ifdef GST_EXT_XV_ENHANCEMENT
-        GST_INFO_OBJECT (xvimagesink, "Call gst_xvimagesink_xwindow_update_geometry!");
+        GST_WARNING("Call gst_xvimagesink_xwindow_update_geometry!");
 #endif /* GST_EXT_XV_ENHANCEMENT */
         gst_xvimagesink_xwindow_update_geometry (xvimagesink);
+#ifdef GST_EXT_XV_ENHANCEMENT
+        GST_WARNING("Return gst_xvimagesink_xwindow_update_geometry!");
+#endif /* GST_EXT_XV_ENHANCEMENT */
         g_mutex_lock (xvimagesink->x_lock);
         configured = TRUE;
         break;
@@ -1926,16 +3400,61 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
   /* Handle Display events */
   while (XPending (xvimagesink->xcontext->disp)) {
     XNextEvent (xvimagesink->xcontext->disp, &e);
-
     switch (e.type) {
       case ClientMessage:{
 #ifdef GST_EXT_XV_ENHANCEMENT
-        int active_pid, deactive_pid;
-        Atom active_win_atom;
-        Atom deactive_win_atom;
-        Atom atom_stream;
+        XClientMessageEvent *cme = (XClientMessageEvent *)&e;
+        Atom buffer_atom = XInternAtom(xvimagesink->xcontext->disp, "XV_RETURN_BUFFER", False);
+        Atom qp_state_atom = XInternAtom(xvimagesink->xcontext->disp, "_E_ILLUME_QUICKPANEL_STATE", False);
+        Atom qp_on_atom = XInternAtom(xvimagesink->xcontext->disp, "_E_ILLUME_QUICKPANEL_ON", False);
+        Atom qp_off_atom = XInternAtom(xvimagesink->xcontext->disp, "_E_ILLUME_QUICKPANEL_OFF", False);
 #endif /* GST_EXT_XV_ENHANCEMENT */
         Atom wm_delete;
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+        GST_LOG_OBJECT(xvimagesink, "message type %d, buffer atom %d", cme->message_type, buffer_atom);
+        if (cme->message_type == buffer_atom) {
+          unsigned int gem_name[XV_BUF_PLANE_NUM] = { 0, };
+
+          GST_DEBUG("data.l[0] -> %d, data.l[1] -> %d",
+                    cme->data.l[0], cme->data.l[1]);
+
+          gem_name[0] = cme->data.l[0];
+          gem_name[1] = cme->data.l[1];
+
+          _remove_displaying_buffer(xvimagesink, gem_name);
+          break;
+        } else if (cme->message_type == sc_status_atom) {
+          int stat = cme->data.s[0];
+          if (stat == UTILX_SCRNCONF_STATUS_NULL) {
+            GST_WARNING ("get UTILX_SCRNCONF_STATUS_NULL event\n");
+            check_hdmi_connected(xvimagesink);
+          } else if (stat == UTILX_SCRNCONF_STATUS_CONNECT) {
+            GST_WARNING ("get UTILX_SCRNCONF_STATUS_CONNECT event\n");
+            check_hdmi_connected(xvimagesink);
+          } else if (stat == UTILX_SCRNCONF_STATUS_ACTIVE) {
+            GST_WARNING ("get UTILX_SCRNCONF_STATUS_ACTIVE event\n");
+            g_signal_emit_by_name(G_OBJECT (xvimagesink), "display-status", DISPLAY_STATUS_HDMI_ACTIVE);
+            check_hdmi_connected(xvimagesink);
+          } else {
+            GST_INFO ("Wrong status\n");
+          }
+          break;
+        } else if (cme->message_type == qp_state_atom) {
+          if ((Atom) cme->data.l[0] == qp_on_atom) {
+            /* quick panel on */
+            GST_WARNING_OBJECT(xvimagesink, "quick panel is ON");
+            xvimagesink->is_quick_panel_on = TRUE;
+            g_signal_emit_by_name(G_OBJECT (xvimagesink), "quick-panel-on", TRUE);
+          } else if ((Atom) cme->data.l[0] == qp_off_atom) {
+            /* quick panel off */
+            GST_WARNING_OBJECT(xvimagesink, "quick panel is OFF");
+            xvimagesink->is_quick_panel_on = FALSE;
+            g_signal_emit_by_name(G_OBJECT (xvimagesink), "quick-panel-on", FALSE);
+          }
+          break;
+        }
+#endif /* GST_EXT_XV_ENHANCEMENT */
 
         wm_delete = XInternAtom (xvimagesink->xcontext->disp,
             "WM_DELETE_WINDOW", True);
@@ -1949,72 +3468,256 @@ gst_xvimagesink_handle_xevents (GstXvImageSink * xvimagesink)
           xvimagesink->xwindow = NULL;
           g_mutex_lock (xvimagesink->x_lock);
         }
+        break;
+      }
 #ifdef GST_EXT_XV_ENHANCEMENT
-        GST_INFO_OBJECT( xvimagesink, "message type : %d", e.xclient.message_type );
+      case VisibilityNotify:
+        if (xvimagesink->xwindow &&
+            (e.xvisibility.window == xvimagesink->xwindow->win)) {
+          if (e.xvisibility.state == VisibilityFullyObscured) {
+            Atom atom_stream;
 
-        active_win_atom   = XInternAtom (xvimagesink->xcontext->disp, "_X_ILLUME_ACTIVATE_WINDOW", False);
-        deactive_win_atom = XInternAtom (xvimagesink->xcontext->disp, "_X_ILLUME_DEACTIVATE_WINDOW", False);
+            GST_WARNING_OBJECT(xvimagesink, "current window is FULLY HIDED");
 
-        if (!active_win_atom || !deactive_win_atom) {
-          GST_WARNING_OBJECT( xvimagesink, "Can NOT get active[%d] or deactive[%d] win atom",
-                                           active_win_atom, deactive_win_atom );
-        } else {
-          if (e.xclient.message_type == deactive_win_atom) {
-            /* Window is DEACTIVATED */
-            /* Get pid of activated/deactivated window */
-            active_pid = e.xclient.data.l[1];
-            deactive_pid = e.xclient.data.l[3];
-
-            if (active_pid != deactive_pid) {
-              GST_INFO_OBJECT( xvimagesink, "XClientMessage : Window DEACTIVATED" );
-
-              xvimagesink->is_hided = TRUE;
-              atom_stream = XInternAtom( xvimagesink->xcontext->disp,
-                                              "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", False );
-              if (atom_stream != None) {
-                if (XvSetPortAttribute(xvimagesink->xcontext->disp,
-                                       xvimagesink->xcontext->xv_port_id,
-                                       atom_stream, 0 ) != Success) {
-                  GST_WARNING_OBJECT( xvimagesink, "STREAM OFF failed" );
-                }
-                XSync( xvimagesink->xcontext->disp, FALSE );
-              }
+            xvimagesink->is_hided = TRUE;
+            g_signal_emit_by_name(G_OBJECT (xvimagesink), "hided-window", TRUE);
+            if (!_is_connected_to_external_display(xvimagesink)) {
+              GST_WARNING_OBJECT(xvimagesink, "no external display, calling XvStopVideo()");
+              XvStopVideo(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xwindow->win);
+              XSync(xvimagesink->xcontext->disp, FALSE);
             } else {
-              GST_INFO_OBJECT( xvimagesink, "Window is DEACTIVATED, but same process. so Do not clear screen." );
+              if (GST_STATE(xvimagesink) == GST_STATE_PLAYING || xvimagesink->keep_external_fullscreen_prev) {
+                GST_WARNING_OBJECT(xvimagesink, "external display is enabled. skip XvStopVideo()");
+              } else {
+                GST_WARNING_OBJECT(xvimagesink, "external display is enabled, but not in the middle of playing, calling XvStopVideo()");
+                XvStopVideo(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xwindow->win);
+                XSync(xvimagesink->xcontext->disp, FALSE);
+              }
             }
-          } else if (e.xclient.message_type == active_win_atom) {
-            /* Window is ACTIVATED */
-            /* Get pid of activated/deactivated window */
-            active_pid = e.xclient.data.l[1];
-            deactive_pid = e.xclient.data.l[3];
+          } else {
+            GST_INFO_OBJECT(xvimagesink, "current window is SHOWN");
 
-            if (active_pid != deactive_pid) {
-              GST_INFO_OBJECT( xvimagesink, "XClientMessage : Window ACTIVATED" );
-
-              g_mutex_unlock (xvimagesink->x_lock);
-              g_mutex_unlock (xvimagesink->flow_lock);
+            if (xvimagesink->is_hided) {
+              g_mutex_unlock(xvimagesink->x_lock);
+              g_mutex_unlock(xvimagesink->flow_lock);
 
               xvimagesink->is_hided = FALSE;
-              gst_xvimagesink_expose (GST_X_OVERLAY (xvimagesink));
+              g_signal_emit_by_name(G_OBJECT (xvimagesink), "hided-window", FALSE);
+              gst_xvimagesink_expose(GST_X_OVERLAY(xvimagesink));
 
-              g_mutex_lock (xvimagesink->flow_lock);
-              g_mutex_lock (xvimagesink->x_lock);
+              g_mutex_lock(xvimagesink->flow_lock);
+              g_mutex_lock(xvimagesink->x_lock);
             } else {
-              GST_INFO_OBJECT( xvimagesink, "Window is ACTIVATED, but same process. so Do not redraw screen." );
+              GST_INFO_OBJECT(xvimagesink, "current window is not HIDED, skip this event");
             }
           }
         }
-#endif /* GST_EXT_XV_ENHANCEMENT */
         break;
-      }
+
+      case PropertyNotify:
+        {
+          XPropertyEvent *noti = (XPropertyEvent *)&e;
+          if(xvimagesink->xwindow) {
+            if (noti->window == xvimagesink->xwindow->win && noti->atom == external_atom) {
+              int value = 0;
+              get_window_prop_card32_property (xvimagesink->xcontext->disp,
+                                               xvimagesink->xwindow->win,
+                                               external_atom, XA_CARDINAL,
+                                               (unsigned int*)&value, 1);
+              if (value) {
+                // If value is 1, video will be displayed only on external display.
+                // video won't be displayed on LCD.
+                g_signal_emit_by_name(G_OBJECT (xvimagesink), "display-status", DISPLAY_STATUS_UNKNOWN_ACTIVE);
+                if(xvimagesink->external_width==0 && xvimagesink->external_height==0) {
+                  xvimagesink->external_width = 1920;
+                  xvimagesink->external_height = 1080;
+                  GST_WARNING("connected unknown external display");
+                }
+              } else {
+                g_signal_emit_by_name(G_OBJECT (xvimagesink), "display-status", DISPLAY_STATUS_NULL); //NULL
+                if(xvimagesink->external_width!=0 || xvimagesink->external_height!=0) {
+                  xvimagesink->external_width = 0;
+                  xvimagesink->external_height = 0;
+                  GST_WARNING("disconnected external display");
+                }
+              }
+
+              g_signal_emit_by_name(G_OBJECT (xvimagesink), "external-resolution", xvimagesink->external_width, xvimagesink->external_height);
+              GST_INFO ("external device : %s\n", (value)?"on":"off");
+            }
+          }
+          break;
+       }
+
+#endif /* GST_EXT_XV_ENHANCEMENT */
       default:
         break;
     }
   }
-
   g_mutex_unlock (xvimagesink->x_lock);
   g_mutex_unlock (xvimagesink->flow_lock);
 }
+#ifdef GST_EXT_XV_ENHANCEMENT
+static int
+get_window_prop_card32_property (Display* dpy, Window win, Atom atom, Atom type,
+                                 unsigned int *val, unsigned int len)
+{
+  unsigned char* prop_ret;
+  Atom type_ret;
+  unsigned long bytes_after, num_ret;
+  int format_ret;
+  unsigned int i;
+  int num;
+  int ret;
+  int (*handler) (Display *, XErrorEvent *) = NULL;
+
+  prop_ret = NULL;
+
+  /* set error handler */
+  error_caught = FALSE;
+  handler = XSetErrorHandler(gst_xvimagesink_handle_xerror);
+
+  ret = XGetWindowProperty(dpy, win, atom, 0, 0x7fffffff, False,
+                           type, &type_ret, &format_ret, &num_ret,
+                           &bytes_after, &prop_ret);
+  XSync(dpy, FALSE);
+  if (ret != Success || error_caught) {
+    GST_WARNING("XGetWindowProperty failed [%d, %d]", ret, error_caught);
+    if (handler) {
+      error_caught = FALSE;
+      XSetErrorHandler (handler);
+    }
+    return -1;
+  }
+
+  if (handler) {
+    error_caught = FALSE;
+    XSetErrorHandler(handler);
+  }
+
+  if (type_ret != type || format_ret != 32)
+    num = -1;
+  else if (num_ret == 0 || !prop_ret)
+    num = 0;
+  else
+  {
+    if (num_ret < len)
+      len = num_ret;
+    for (i = 0; i < len; i++)
+      val[i] = ((unsigned long *)prop_ret)[i];
+    num = len;
+  }
+
+  if (prop_ret)
+    XFree(prop_ret);
+
+  return num;
+}
+
+static void check_hdmi_connected(GstXvImageSink *xvimagesink)
+{
+  char *str_output = NULL;
+  char *str_resolution = NULL;
+  int external[2];
+  int cnt = 0;
+  char** list = NULL;
+  char** walk = NULL;
+
+  UtilxScrnConf *scrnconf = utilx_scrnconf_allocate();
+  if (!scrnconf)
+  {
+    GST_WARNING ("fail to allocate scrnconf");
+    return;
+  }
+  utilx_scrnconf_get_info (xvimagesink->xcontext->disp, scrnconf);
+
+  str_output = scrnconf->str_output;
+
+  if (scrnconf->status == UTILX_SCRNCONF_STATUS_CONNECT)
+  {
+    GST_INFO("CONNECT");
+  }
+  else if (scrnconf->status == UTILX_SCRNCONF_STATUS_ACTIVE)
+  {
+     GST_INFO("ACTIVE");
+
+    list = g_strsplit(scrnconf->str_resolution, "x", 2);
+
+    if (!list)
+    {
+        if (scrnconf)
+        utilx_scrnconf_free (scrnconf);
+        return;
+    }
+    for(walk = list; *walk; walk++)
+    {
+      external[cnt++] = atoi(*walk);
+    }
+    if (cnt!=2) {
+      GST_WARNING("data error");
+      if(scrnconf)
+        utilx_scrnconf_free (scrnconf);
+      g_strfreev(list);
+      return;
+    } else {
+      xvimagesink->external_width = external[0];
+      xvimagesink->external_height = external[1];
+      g_strfreev(list);
+    }
+    GST_INFO("external display : %d * %d", xvimagesink->external_width, xvimagesink->external_height);
+    g_signal_emit_by_name(G_OBJECT (xvimagesink), "external-resolution", xvimagesink->external_width, xvimagesink->external_height);
+  }
+  else
+  {
+     GST_INFO("NULL");
+  }
+
+  str_resolution = scrnconf->str_resolution;
+
+  if (scrnconf->dispmode == UTILX_SCRNCONF_DISPMODE_CLONE)
+  {
+     GST_INFO("CLONE mode");
+  }
+  else if (scrnconf->dispmode == UTILX_SCRNCONF_DISPMODE_EXTENDED)
+  {
+    GST_INFO("EXTENDED mode");
+  }
+  else
+  {
+    GST_INFO("NULL mode");
+  }
+
+  GST_INFO ("[Display status] : %s, %s\n", str_output, str_resolution);
+
+  if(scrnconf)
+    utilx_scrnconf_free (scrnconf);
+
+}
+
+static gboolean
+check_supportable_port_attr(GstXvImageSink * xvimagesink, gchar* attr_name)
+{
+  int i = 0;
+  int count = 0;
+
+  XvAttribute *attr = XvQueryPortAttributes(xvimagesink->xcontext->disp,
+                                            xvimagesink->xcontext->xv_port_id, &count);
+  if (attr) {
+    for (i = 0 ; i < count ; i++) {
+      if (!strcmp(attr[i].name, attr_name)) {
+        GST_INFO("%s[index %d] found", attr_name, i);
+        XFree(attr);
+        return TRUE;
+      }
+    }
+    XFree(attr);
+  } else {
+    GST_WARNING("XvQueryPortAttributes disp:%d, port_id:%d failed",
+                xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id);
+  }
+  return FALSE;
+}
+#endif //GST_EXT_XV_ENHANCEMENT
 
 static void
 gst_lookup_xv_port_from_adaptor (GstXContext * xcontext,
@@ -2044,6 +3747,40 @@ gst_lookup_xv_port_from_adaptor (GstXContext * xcontext,
     }
   }
 }
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+static void
+gst_lookup_xv_port_for_subtitle (GstXContext * xcontext,
+    XvAdaptorInfo * adaptors, guint adaptor_no, guint nb_adaptors)
+{
+  int i;
+  if (!adaptors)
+    return;
+  for (i = 0; i < nb_adaptors; i++)
+  {
+    int min, max;
+    if (!(adaptors[i].type & XvOutputMask) ||
+        !(adaptors[i].type & XvStillMask))
+        continue;
+    min = adaptors[i].base_id;
+    max = adaptors[i].base_id + adaptors[i].num_ports;
+    for (adaptors[adaptor_no].num_ports = min; adaptors[adaptor_no].num_ports < max ; adaptors[adaptor_no].num_ports++)
+    {
+      if (XvGrabPort (xcontext->disp, adaptors[adaptor_no].num_ports, 0) == Success)
+      {
+        GST_INFO ("========================================");
+        GST_INFO ("XvGrabPort  success : %ld", adaptors[adaptor_no].num_ports);
+        GST_INFO ("========================================");
+        xcontext->xv_port_id = adaptors[adaptor_no].num_ports;
+        return;
+      }
+      GST_WARNING ("fail : grab port(%ld)\n", adaptors[adaptor_no].num_ports);
+      usleep(10000);
+    }
+  }
+}
+#endif
+
 
 /* This function generates a caps with all supported format by the first
    Xv grabable port we find. We store each one of the supported formats in a
@@ -2085,7 +3822,7 @@ gst_xvimagesink_get_xv_support (GstXvImageSink * xvimagesink,
 
   xcontext->xv_port_id = 0;
 
-  GST_DEBUG ("Found %u XV adaptor(s)", xcontext->nb_adaptors);
+  GST_DEBUG_OBJECT(xvimagesink, "Found %u XV adaptor(s)", xcontext->nb_adaptors);
 
   xcontext->adaptors =
       (gchar **) g_malloc0 (xcontext->nb_adaptors * sizeof (gchar *));
@@ -2098,14 +3835,27 @@ gst_xvimagesink_get_xv_support (GstXvImageSink * xvimagesink,
   if (xvimagesink->adaptor_no >= 0 &&
       xvimagesink->adaptor_no < xcontext->nb_adaptors) {
     /* Find xv port from user defined adaptor */
-    gst_lookup_xv_port_from_adaptor (xcontext, adaptors,
-        xvimagesink->adaptor_no);
+#ifdef GST_EXT_XV_ENHANCEMENT
+    if(!xvimagesink->subpicture)
+#endif
+      gst_lookup_xv_port_from_adaptor (xcontext, adaptors, xvimagesink->adaptor_no);
+#ifdef GST_EXT_XV_ENHANCEMENT
+    else
+      gst_lookup_xv_port_for_subtitle (xcontext, adaptors, xvimagesink->adaptor_no, xcontext->nb_adaptors);
+#endif
   }
 
   if (!xcontext->xv_port_id) {
     /* Now search for an adaptor that supports XvImageMask */
     for (i = 0; i < xcontext->nb_adaptors && !xcontext->xv_port_id; i++) {
-      gst_lookup_xv_port_from_adaptor (xcontext, adaptors, i);
+#ifdef GST_EXT_XV_ENHANCEMENT
+      if(!xvimagesink->subpicture)
+#endif
+        gst_lookup_xv_port_from_adaptor (xcontext, adaptors, i);
+#ifdef GST_EXT_XV_ENHANCEMENT
+      else
+        gst_lookup_xv_port_for_subtitle (xcontext, adaptors, i, xcontext->nb_adaptors);
+#endif
       xvimagesink->adaptor_no = i;
     }
   }
@@ -2225,7 +3975,9 @@ gst_xvimagesink_get_xv_support (GstXvImageSink * xvimagesink,
   }
 
   XvFreeEncodingInfo (encodings);
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+if (!xvimagesink->subpicture) {
+#endif
   /* We get all image formats supported by our port */
   formats = XvListImageFormats (xcontext->disp,
       xcontext->xv_port_id, &nb_formats);
@@ -2262,6 +4014,9 @@ gst_xvimagesink_get_xv_support (GstXvImageSink * xvimagesink,
         }
 
         format_caps = gst_caps_new_simple ("video/x-raw-rgb",
+#ifdef GST_EXT_XV_ENHANCEMENT
+            "format", GST_TYPE_FOURCC, formats[i].id,
+#endif /* GST_EXT_XV_ENHANCEMENT */
             "endianness", G_TYPE_INT, endianness,
             "depth", G_TYPE_INT, fmt->depth,
             "bpp", G_TYPE_INT, fmt->bits_per_pixel,
@@ -2324,6 +4079,9 @@ gst_xvimagesink_get_xv_support (GstXvImageSink * xvimagesink,
         ("No supported format found"));
     return NULL;
   }
+#ifdef GST_EXT_XV_ENHANCEMENT
+} //subpicture
+#endif
 
   return caps;
 }
@@ -2340,8 +4098,13 @@ gst_xvimagesink_event_thread (GstXvImageSink * xvimagesink)
     if (xvimagesink->xwindow) {
       gst_xvimagesink_handle_xevents (xvimagesink);
     }
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+    g_usleep (_EVENT_THREAD_CHECK_INTERVAL);
+#else /* GST_EXT_XV_ENHANCEMENT */
     /* FIXME: do we want to align this with the framerate or anything else? */
     g_usleep (G_USEC_PER_SEC / 20);
+#endif /* GST_EXT_XV_ENHANCEMENT */
 
     GST_OBJECT_LOCK (xvimagesink);
   }
@@ -2394,6 +4157,46 @@ gst_xvimagesink_manage_event_thread (GstXvImageSink * xvimagesink)
 }
 
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+/**
+ * gst_xvimagesink_prepare_xid:
+ * @overlay: a #GstXOverlay which does not yet have an XWindow or XPixmap.
+ *
+ * This will post a "prepare-xid" element message with video size and display size on the bus
+ * to give applications an opportunity to call
+ * gst_x_overlay_set_xwindow_id() before a plugin creates its own
+ * window or pixmap.
+ *
+ * This function should only be used by video overlay plugin developers.
+ */
+static void
+gst_xvimagesink_prepare_xid (GstXOverlay * overlay)
+{
+  GstStructure *s;
+  GstMessage *msg;
+
+  g_return_if_fail (overlay != NULL);
+  g_return_if_fail (GST_IS_X_OVERLAY (overlay));
+
+  GstXvImageSink *xvimagesink;
+  xvimagesink = GST_XVIMAGESINK (GST_OBJECT (overlay));
+
+  GST_DEBUG ("post \"prepare-xid\" element message with video-width(%d), video-height(%d), display-width(%d), display-height(%d)",
+        GST_VIDEO_SINK_WIDTH (xvimagesink), GST_VIDEO_SINK_HEIGHT (xvimagesink), xvimagesink->xcontext->width, xvimagesink->xcontext->height);
+
+  GST_LOG_OBJECT (GST_OBJECT (overlay), "prepare xid");
+  s = gst_structure_new ("prepare-xid",
+        "video-width", G_TYPE_INT, GST_VIDEO_SINK_WIDTH (xvimagesink),
+        "video-height", G_TYPE_INT, GST_VIDEO_SINK_HEIGHT (xvimagesink),
+        "display-width", G_TYPE_INT, xvimagesink->xcontext->width,
+        "display-height", G_TYPE_INT, xvimagesink->xcontext->height,
+        NULL);
+  msg = gst_message_new_element (GST_OBJECT (overlay), s);
+  gst_element_post_message (GST_ELEMENT (overlay), msg);
+}
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
+
 /* This function calculates the pixel aspect ratio based on the properties
  * in the xcontext structure and stores it there. */
 static void
@@ -2403,6 +4206,9 @@ gst_xvimagesink_calculate_pixel_aspect_ratio (GstXContext * xcontext)
     {1, 1},                     /* regular screen */
     {16, 15},                   /* PAL TV */
     {11, 10},                   /* 525 line Rec.601 video */
+#ifdef GST_EXT_XV_ENHANCEMENT
+    {44, 46},                   /* Gear S Curved Display */
+#endif
     {54, 59},                   /* 625 line Rec.601 video */
     {64, 45},                   /* 1280x1024 on 16:9 display */
     {5, 3},                     /* 1280x1024 on 4:3 display */
@@ -2461,7 +4267,7 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
   GstXContext *xcontext = NULL;
   XPixmapFormatValues *px_formats = NULL;
   gint nb_formats = 0, i, j, N_attr;
-  XvAttribute *xv_attr;
+  XvAttribute *xv_attr = NULL;
   Atom prop_atom;
   const char *channels[4] = { "XV_HUE", "XV_SATURATION",
     "XV_BRIGHTNESS", "XV_CONTRAST"
@@ -2475,7 +4281,6 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
   g_mutex_lock (xvimagesink->x_lock);
 
   xcontext->disp = XOpenDisplay (xvimagesink->display_name);
-
   if (!xcontext->disp) {
     g_mutex_unlock (xvimagesink->x_lock);
     g_free (xcontext);
@@ -2483,6 +4288,22 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
         ("Could not initialise Xv output"), ("Could not open display"));
     return NULL;
   }
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+  {
+    int i = 0;
+    for (i = 0; i < MAX_DISPLAY_IN_XVIMAGESINK; i++) {
+      if (g_display_id[i] == NULL) {
+        g_display_id[i] = xcontext->disp;
+        GST_INFO_OBJECT(xvimagesink, "x display array[%d] = display(0x%x)", i, xcontext->disp);
+        break;
+      }
+    }
+    if (i == MAX_DISPLAY_IN_XVIMAGESINK) {
+      GST_WARNING_OBJECT(xvimagesink, "out of index(%d) for x display array", i);
+    }
+  }
+#endif
 
   xcontext->screen = DefaultScreenOfDisplay (xcontext->disp);
   xcontext->screen_num = DefaultScreen (xcontext->disp);
@@ -2505,6 +4326,16 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
   px_formats = XListPixmapFormats (xcontext->disp, &nb_formats);
 
   if (!px_formats) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+  {
+    int i = 0;
+    for (i = 0; i < MAX_DISPLAY_IN_XVIMAGESINK; i++) {
+      if (g_display_id[i] == xcontext->disp) {
+        g_display_id[i] = NULL;
+      }
+    }
+  }
+#endif
     XCloseDisplay (xcontext->disp);
     g_mutex_unlock (xvimagesink->x_lock);
     g_free (xcontext->par);
@@ -2542,7 +4373,21 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
 
   xcontext->caps = gst_xvimagesink_get_xv_support (xvimagesink, xcontext);
 
-  if (!xcontext->caps) {
+  if (!xcontext->caps
+#ifdef GST_EXT_XV_ENHANCEMENT
+    && !xvimagesink->subpicture
+#endif
+    ) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+  {
+    int i = 0;
+    for (i = 0; i < MAX_DISPLAY_IN_XVIMAGESINK; i++) {
+      if (g_display_id[i] == xcontext->disp) {
+        g_display_id[i] = NULL;
+      }
+    }
+  }
+#endif
     XCloseDisplay (xcontext->disp);
     g_mutex_unlock (xvimagesink->x_lock);
     g_free (xcontext->par);
@@ -2551,21 +4396,26 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
     return NULL;
   }
 #ifdef HAVE_XSHM
-  /* Search for XShm extension support */
-  if (XShmQueryExtension (xcontext->disp) &&
-      gst_xvimagesink_check_xshm_calls (xcontext)) {
-    xcontext->use_xshm = TRUE;
-    GST_DEBUG ("xvimagesink is using XShm extension");
-  } else
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (!xvimagesink->subpicture) {
+#endif //GST_EXT_XV_ENHANCEMENT
+    /* Search for XShm extension support */
+    if (XShmQueryExtension (xcontext->disp) &&
+        gst_xvimagesink_check_xshm_calls (xcontext)) {
+      xcontext->use_xshm = TRUE;
+      GST_DEBUG ("xvimagesink is using XShm extension");
+    } else
 #endif /* HAVE_XSHM */
-  {
-    xcontext->use_xshm = FALSE;
-    GST_DEBUG ("xvimagesink is not using XShm extension");
+    {
+      xcontext->use_xshm = FALSE;
+      GST_DEBUG ("xvimagesink is not using XShm extension");
+    }
+
+    xv_attr = XvQueryPortAttributes (xcontext->disp,
+        xcontext->xv_port_id, &N_attr);
+#ifdef GST_EXT_XV_ENHANCEMENT
   }
-
-  xv_attr = XvQueryPortAttributes (xcontext->disp,
-      xcontext->xv_port_id, &N_attr);
-
+#endif //GST_EXT_XV_ENHANCEMENT
 
   /* Generate the channels list */
   for (i = 0; i < (sizeof (channels) / sizeof (char *)); i++) {
@@ -2616,12 +4466,17 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
       }
     }
   }
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (!xvimagesink->subpicture) {
+#endif
   if (xv_attr)
     XFree (xv_attr);
-
 #ifdef GST_EXT_XV_ENHANCEMENT
-  set_display_mode(xcontext, xvimagesink->display_mode);
+  }
+  if(!xvimagesink->subpicture) {
+    set_display_mode(xvimagesink->xcontext, xvimagesink->display_mode);
+    set_csc_range(xcontext, xvimagesink->csc_range);
+  }
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   g_mutex_unlock (xvimagesink->x_lock);
@@ -2634,7 +4489,7 @@ gst_xvimagesink_xcontext_get (GstXvImageSink * xvimagesink)
 static void
 gst_xvimagesink_xcontext_clear (GstXvImageSink * xvimagesink)
 {
-  GList *formats_list, *channels_list;
+  GList *formats_list, *channels_list = NULL;
   GstXContext *xcontext;
   gint i = 0;
 
@@ -2652,7 +4507,9 @@ gst_xvimagesink_xcontext_clear (GstXvImageSink * xvimagesink)
 
   GST_OBJECT_UNLOCK (xvimagesink);
 
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (!xvimagesink->subpicture)  {
+#endif
   formats_list = xcontext->formats_list;
 
   while (formats_list) {
@@ -2667,7 +4524,9 @@ gst_xvimagesink_xcontext_clear (GstXvImageSink * xvimagesink)
     g_list_free (xcontext->formats_list);
 
   channels_list = xcontext->channels_list;
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+  }
+#endif
   while (channels_list) {
     GstColorBalanceChannel *channel = channels_list->data;
 
@@ -2696,8 +4555,17 @@ gst_xvimagesink_xcontext_clear (GstXvImageSink * xvimagesink)
 
   XvUngrabPort (xcontext->disp, xcontext->xv_port_id, 0);
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  {
+    int i = 0;
+    for (i = 0; i < MAX_DISPLAY_IN_XVIMAGESINK; i++) {
+      if (g_display_id[i] == xcontext->disp) {
+        g_display_id[i] = NULL;
+      }
+    }
+  }
+#endif
   XCloseDisplay (xcontext->disp);
-
   g_mutex_unlock (xvimagesink->x_lock);
 
   g_free (xcontext);
@@ -2753,10 +4621,13 @@ gst_xvimagesink_getcaps (GstBaseSink * bsink)
   GstXvImageSink *xvimagesink;
 
   xvimagesink = GST_XVIMAGESINK (bsink);
-
-  if (xvimagesink->xcontext)
+  if (xvimagesink->xcontext
+#ifdef GST_EXT_XV_ENHANCEMENT
+    && !xvimagesink->subpicture
+#endif
+) {
     return gst_caps_ref (xvimagesink->xcontext->caps);
-
+  }
   return
       gst_caps_copy (gst_pad_get_pad_template_caps (GST_VIDEO_SINK_PAD
           (xvimagesink)));
@@ -2779,7 +4650,15 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
   const GValue *fps;
   guint num, den;
 #ifdef GST_EXT_XV_ENHANCEMENT
-  gboolean enable_last_buffer;
+  gboolean subtitle;
+  gchar *str_in = gst_caps_to_string(caps);
+  if(str_in == NULL) {
+    GST_ERROR("gst_caps_to_string() returns NULL...");
+  }else{
+    GST_INFO("In setcaps. incaps:%s", str_in);
+    g_free (str_in);
+    str_in = NULL;
+  }
 #endif /* #ifdef GST_EXT_XV_ENHANCEMENT */
 
   xvimagesink = GST_XVIMAGESINK (bsink);
@@ -2788,7 +4667,11 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
       "In setcaps. Possible caps %" GST_PTR_FORMAT ", setting caps %"
       GST_PTR_FORMAT, xvimagesink->xcontext->caps, caps);
 
-  if (!gst_caps_can_intersect (xvimagesink->xcontext->caps, caps))
+  if (!gst_caps_can_intersect (xvimagesink->xcontext->caps, caps)
+#ifdef GST_EXT_XV_ENHANCEMENT
+    && !xvimagesink->subpicture
+#endif
+    )
     goto incompatible_caps;
 
   structure = gst_caps_get_structure (caps, 0);
@@ -2796,7 +4679,13 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
   ret &= gst_structure_get_int (structure, "height", &video_height);
   fps = gst_structure_get_value (structure, "framerate");
   ret &= (fps != NULL);
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if(gst_structure_get_boolean (structure, "subtitle", &subtitle) && xvimagesink->subpicture)
+  {
+    xvimagesink->is_subpicture_format = TRUE;
+    GST_LOG("It is type of subpicture and subtitle.");
+  }
+#endif
   if (!ret)
     goto incomplete_caps;
 
@@ -2804,16 +4693,19 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
   xvimagesink->aligned_width = video_width;
   xvimagesink->aligned_height = video_height;
 
-  /* get enable-last-buffer */
-  g_object_get(G_OBJECT(xvimagesink), "enable-last-buffer", &enable_last_buffer, NULL);
-  GST_INFO_OBJECT(xvimagesink, "current enable-last-buffer : %d", enable_last_buffer);
-
-  /* flush if enable-last-buffer is TRUE */
-  if (enable_last_buffer) {
-    GST_INFO_OBJECT(xvimagesink, "flush last-buffer");
-    g_object_set(G_OBJECT(xvimagesink), "enable-last-buffer", FALSE, NULL);
-    g_object_set(G_OBJECT(xvimagesink), "enable-last-buffer", TRUE, NULL);
+#ifdef GST_EXT_ENABLE_HEVC
+  /*get combine prop of hevc*/
+  if(gst_structure_get_int (structure, "yuvcombine", &(xvimagesink->need_combine_data)))
+  {
+    GST_INFO_OBJECT(xvimagesink, "need combine data : %d", xvimagesink->need_combine_data);
   }
+  else
+  {
+    /*Not need to combine data, just directly copy*/
+    xvimagesink->need_combine_data = 0;
+  }
+#endif
+  _remove_last_buffer(xvimagesink);
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   xvimagesink->fps_n = gst_value_get_fraction_numerator (fps);
@@ -2821,11 +4713,15 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
 
   xvimagesink->video_width = video_width;
   xvimagesink->video_height = video_height;
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (!xvimagesink->subpicture) {
+#endif
   im_format = gst_xvimagesink_get_format_from_caps (xvimagesink, caps);
   if (im_format == -1)
     goto invalid_format;
-
+#ifdef GST_EXT_XV_ENHANCEMENT
+  }
+#endif
   /* get aspect ratio from caps if it's present, and
    * convert video width and height to a display width and height
    * using wd / hd = wv / hv * PARv / PARd */
@@ -2902,23 +4798,37 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
 
   /* Notify application to set xwindow id now */
   g_mutex_lock (xvimagesink->flow_lock);
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (!xvimagesink->xwindow && !xvimagesink->get_pixmap_cb) {
+    g_mutex_unlock (xvimagesink->flow_lock);
+    gst_xvimagesink_prepare_xid (GST_X_OVERLAY (xvimagesink));
+#else
   if (!xvimagesink->xwindow) {
     g_mutex_unlock (xvimagesink->flow_lock);
     gst_x_overlay_prepare_xwindow_id (GST_X_OVERLAY (xvimagesink));
+#endif
   } else {
     g_mutex_unlock (xvimagesink->flow_lock);
   }
+#ifdef GST_EXT_XV_ENHANCEMENT
+if (!xvimagesink->is_subpicture_format) {
+#endif
+    /* Creating our window and our image with the display size in pixels */
+    if (GST_VIDEO_SINK_WIDTH (xvimagesink) <= 0 ||
+        GST_VIDEO_SINK_HEIGHT (xvimagesink) <= 0)
+      goto no_display_size;
 
-  /* Creating our window and our image with the display size in pixels */
-  if (GST_VIDEO_SINK_WIDTH (xvimagesink) <= 0 ||
-      GST_VIDEO_SINK_HEIGHT (xvimagesink) <= 0)
-    goto no_display_size;
-
-  g_mutex_lock (xvimagesink->flow_lock);
-  if (!xvimagesink->xwindow) {
-    xvimagesink->xwindow = gst_xvimagesink_xwindow_new (xvimagesink,
-        GST_VIDEO_SINK_WIDTH (xvimagesink),
-        GST_VIDEO_SINK_HEIGHT (xvimagesink));
+    g_mutex_lock (xvimagesink->flow_lock);
+#ifdef GST_EXT_XV_ENHANCEMENT
+    if (!xvimagesink->xwindow && !xvimagesink->get_pixmap_cb) {
+      GST_DEBUG_OBJECT (xvimagesink, "xwindow is null and not multi-pixmaps usage case");
+#else
+    if (!xvimagesink->xwindow) {
+#endif
+      xvimagesink->xwindow = gst_xvimagesink_xwindow_new (xvimagesink,
+          GST_VIDEO_SINK_WIDTH (xvimagesink),
+          GST_VIDEO_SINK_HEIGHT (xvimagesink));
+    }
   }
 
   /* After a resize, we want to redraw the borders in case the new frame size
@@ -2930,7 +4840,8 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
   if ((xvimagesink->xvimage) &&
       ((im_format != xvimagesink->xvimage->im_format) ||
           (video_width != xvimagesink->xvimage->width) ||
-          (video_height != xvimagesink->xvimage->height))) {
+          (video_height != xvimagesink->xvimage->height)) &&
+          (!xvimagesink->subpicture)) {
     GST_DEBUG_OBJECT (xvimagesink,
         "old format %" GST_FOURCC_FORMAT ", new format %" GST_FOURCC_FORMAT,
         GST_FOURCC_ARGS (xvimagesink->xvimage->im_format),
@@ -2940,6 +4851,12 @@ gst_xvimagesink_setcaps (GstBaseSink * bsink, GstCaps * caps)
     xvimagesink->xvimage = NULL;
   }
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  /* In case of starting player with connecting external display, we have to check status.
+   * It will be unconditionally executed. */
+  if(!xvimagesink->is_subpicture_format)
+    check_hdmi_connected(xvimagesink);
+#endif
   g_mutex_unlock (xvimagesink->flow_lock);
 
   return TRUE;
@@ -2974,7 +4891,9 @@ no_display_size:
         ("Error calculating the output display ratio of the video."));
     return FALSE;
   }
+#ifdef GST_EXT_XV_ENHANCEMENT
 }
+#endif
 
 static GstStateChangeReturn
 gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
@@ -2990,6 +4909,9 @@ gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
 
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("NULL_TO_READY start");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       /* Initializing the XContext */
       if (xvimagesink->xcontext == NULL) {
         xcontext = gst_xvimagesink_xcontext_get (xvimagesink);
@@ -3013,32 +4935,39 @@ gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
       XSynchronize (xvimagesink->xcontext->disp, xvimagesink->synchronous);
       gst_xvimagesink_update_colorbalance (xvimagesink);
       gst_xvimagesink_manage_event_thread (xvimagesink);
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("NULL_TO_READY done");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("READY_TO_PAUSED start");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       g_mutex_lock (xvimagesink->pool_lock);
       xvimagesink->pool_invalid = FALSE;
       g_mutex_unlock (xvimagesink->pool_lock);
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("READY_TO_PAUSED done");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
 #ifdef GST_EXT_XV_ENHANCEMENT
-      g_mutex_lock (xvimagesink->x_lock);
-      atom_preemption = XInternAtom( xvimagesink->xcontext->disp,
-                                     "_USER_WM_PORT_ATTRIBUTE_PREEMPTION", False );
-      if (atom_preemption != None) {
-         if (XvSetPortAttribute(xvimagesink->xcontext->disp,
-                                xvimagesink->xcontext->xv_port_id,
-                                atom_preemption, 1 ) != Success) {
-            GST_ERROR_OBJECT(xvimagesink, "%d: XvSetPortAttribute: preemption failed.\n", atom_preemption);
-         }
-         XSync (xvimagesink->xcontext->disp, FALSE);
-      }
-      g_mutex_unlock (xvimagesink->x_lock);
+      if(vconf_set_int(VCONFKEY_XV_STATE, (xvimagesink->eos_received << 2) | XV_STATUS_PLAYING))
+        GST_WARNING("vconf set fail");
+      GST_WARNING("PAUSED_TO_PLAYING done");
+      xvimagesink->is_during_seek = FALSE;
+      xvimagesink->keep_external_fullscreen_prev = FALSE;
 #endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("PAUSED_TO_READY start");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       g_mutex_lock (xvimagesink->pool_lock);
       xvimagesink->pool_invalid = TRUE;
       g_mutex_unlock (xvimagesink->pool_lock);
+#ifdef GST_EXT_XV_ENHANCEMENT
+#endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     default:
       break;
@@ -3049,29 +4978,119 @@ gst_xvimagesink_change_state (GstElement * element, GstStateChange transition)
   switch (transition) {
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
 #ifdef GST_EXT_XV_ENHANCEMENT
-      xvimagesink->rotate_changed = TRUE;
+      GST_WARNING("PLAYING_TO_PAUSED start");
+      g_mutex_lock (xvimagesink->flow_lock);
+      /* init displayed buffer count */
+      xvimagesink->displayed_buffer_count = 0;
+
       g_mutex_lock (xvimagesink->x_lock);
-      atom_preemption = XInternAtom( xvimagesink->xcontext->disp,
-                                     "_USER_WM_PORT_ATTRIBUTE_PREEMPTION", False );
-      if (atom_preemption != None) {
-         if (XvSetPortAttribute(xvimagesink->xcontext->disp,
-                                xvimagesink->xcontext->xv_port_id,
-                                atom_preemption, 0 ) != Success) {
-            GST_ERROR_OBJECT(xvimagesink, "%d: XvSetPortAttribute: preemption failed.\n", atom_preemption);
-         }
-         XSync (xvimagesink->xcontext->disp, FALSE);
+      if ((xvimagesink->is_hided || xvimagesink->is_quick_panel_on || xvimagesink->is_multi_window) && _is_connected_to_external_display(xvimagesink) && !xvimagesink->keep_external_fullscreen_prev) {
+        GST_WARNING_OBJECT(xvimagesink, "release external display mode");
+        XvStopVideo (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id,
+                     xvimagesink->xwindow->win);
+        XSync(xvimagesink->xcontext->disp, FALSE);
+        xvimagesink->skip_frame_due_to_external_dev = TRUE;
+      }
+      if((xvimagesink->is_hided_subpicture || xvimagesink->is_quick_panel_on_subpicture || xvimagesink->is_multi_window_subpicture)
+        && xvimagesink->is_subpicture_format && xvimagesink->pixmap_for_subpicture) {
+        GST_WARNING_OBJECT(xvimagesink, "calling XvStopVideo() for %d port [pixmap : %p]", xvimagesink->xcontext->xv_port_id, xvimagesink->pixmap_for_subpicture);
+        XvStopVideo(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->pixmap_for_subpicture);
+        XSync(xvimagesink->xcontext->disp, FALSE);
       }
       g_mutex_unlock (xvimagesink->x_lock);
+      g_mutex_unlock (xvimagesink->flow_lock);
+      if(vconf_set_int(VCONFKEY_XV_STATE, (xvimagesink->eos_received << 2) | XV_STATUS_PAUSED))
+        GST_WARNING("vconf set fail");
+      GST_WARNING("PLAYING_TO_PAUSED done");
 #endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING_OBJECT(xvimagesink, "PAUSED_TO_READY start - %d %d %d %p",
+                                      xvimagesink->is_zero_copy_format,
+                                      xvimagesink->enable_flush_buffer,
+                                      xvimagesink->secure_path,
+                                      xvimagesink->get_pixmap_cb);
+
+      if ((xvimagesink->enable_flush_buffer == FALSE ||
+           xvimagesink->secure_path == SECURE_PATH_ON) &&
+          xvimagesink->xcontext && xvimagesink->xwindow) {
+        GST_WARNING_OBJECT(xvimagesink, "Call XvStopVideo and remove last buffer");
+        g_mutex_lock(xvimagesink->x_lock);
+        XvStopVideo(xvimagesink->xcontext->disp,
+                    xvimagesink->xcontext->xv_port_id,
+                    xvimagesink->xwindow->win);
+        XSync(xvimagesink->xcontext->disp, FALSE);
+        g_mutex_unlock(xvimagesink->x_lock);
+        _remove_last_buffer(xvimagesink);
+      } else if (xvimagesink->is_zero_copy_format &&
+                 xvimagesink->xvimage &&
+                 xvimagesink->xvimage->xvimage &&
+                 !xvimagesink->get_pixmap_cb) {
+        if (gst_xvimagesink_make_flush_buffer(xvimagesink)) {
+          int i = 0;
+          XV_DATA_PTR img_data = (XV_DATA_PTR) xvimagesink->xvimage->xvimage->data;
+          memset(img_data, 0x0, sizeof(XV_DATA));
+          XV_INIT_DATA(img_data);
+
+          img_data->bo[0] = xvimagesink->flush_buffer->bo[0];
+          img_data->bo[1] = xvimagesink->flush_buffer->bo[1];
+          img_data->bo[2] = xvimagesink->flush_buffer->bo[2];
+
+          gst_xvimagesink_xvimage_put(xvimagesink, xvimagesink->xvimage);
+
+          GST_WARNING_OBJECT(xvimagesink, "gst_xvimagesink_xvimage_put done");
+
+          /* check whether putimage is succeeded or not */
+          g_mutex_lock(xvimagesink->display_buffer_lock);
+
+          for (i = 0 ; i < DISPLAYING_BUFFERS_MAX_NUM ; i++) {
+            if (xvimagesink->displaying_buffers[i].gem_name[0] > 0) {
+              if ((img_data->dmabuf_fd[0] > 0 &&
+                   xvimagesink->displaying_buffers[i].dmabuf_fd[0] == img_data->dmabuf_fd[0] &&
+                   xvimagesink->displaying_buffers[i].dmabuf_fd[1] == img_data->dmabuf_fd[1] &&
+                   xvimagesink->displaying_buffers[i].dmabuf_fd[2] == img_data->dmabuf_fd[2]) ||
+                  (img_data->bo[0] &&
+                   xvimagesink->displaying_buffers[i].bo[0] == img_data->bo[0] &&
+                   xvimagesink->displaying_buffers[i].bo[1] == img_data->bo[1] &&
+                   xvimagesink->displaying_buffers[i].bo[2] == img_data->bo[2])) {
+                GST_WARNING_OBJECT(xvimagesink, "found flush buffer in displaying_buffers");
+                break;
+              }
+            }
+          }
+
+          if (i >= DISPLAYING_BUFFERS_MAX_NUM) {
+            GST_WARNING_OBJECT(xvimagesink, "flush buffer is not existed in displaying_buffers");
+            _release_flush_buffer(xvimagesink);
+          } else {
+            _remove_last_buffer(xvimagesink);
+          }
+
+          g_mutex_unlock(xvimagesink->display_buffer_lock);
+        }
+      }
+#endif /* GST_EXT_XV_ENHANCEMENT */
       xvimagesink->fps_n = 0;
       xvimagesink->fps_d = 1;
       GST_VIDEO_SINK_WIDTH (xvimagesink) = 0;
       GST_VIDEO_SINK_HEIGHT (xvimagesink) = 0;
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("PAUSED_TO_READY done");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
+#ifdef GST_EXT_XV_ENHANCEMENT
+      GST_WARNING("READY_TO_NULL start");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       gst_xvimagesink_reset (xvimagesink);
+#ifdef GST_EXT_XV_ENHANCEMENT
+      /* close drm */
+      drm_fini(xvimagesink);
+      /* init displaying_buffer_count */
+      xvimagesink->displaying_buffer_count = 0;
+      GST_WARNING("READY_TO_NULL done");
+#endif /* GST_EXT_XV_ENHANCEMENT */
       break;
     default:
       break;
@@ -3102,15 +5121,178 @@ gst_xvimagesink_get_times (GstBaseSink * bsink, GstBuffer * buf,
   }
 }
 
+#ifdef GST_EXT_ENABLE_HEVC
+static void
+gst_xvimagesink_combine_i420_scmn_data(GstXvImageSink *xvimagesink, GstBuffer *buf)
+{
+    unsigned int outsize = 0;
+    unsigned char *temp_outbuf = xvimagesink->xvimage->xvimage->data;
+    int cnt = 0, j = 0;
+    unsigned char *temp_imgb;
+    SCMN_IMGB *imgb = NULL;
+    int stride, w, h, i;
+
+    GST_DEBUG("Begin");
+    imgb = (SCMN_IMGB *)GST_BUFFER_DATA(buf);
+    if(imgb == NULL || imgb->a[0] == NULL)
+    {
+        return;
+    }
+
+    stride = GST_ROUND_UP_4 (imgb->w[0]);
+    h = imgb->h[0];
+    w = imgb->w[0];
+    /*Y plane copy */
+    for (i = 0; i < h; i++)
+    {
+        memcpy (temp_outbuf + i * stride, imgb->a[0] + i * imgb->s[0], w);
+    }
+
+    temp_outbuf += GST_ROUND_UP_4 (imgb->w[0]) * GST_ROUND_UP_2 (imgb->h[0]);
+
+    stride = GST_ROUND_UP_4 (GST_ROUND_UP_2 (imgb->w[0]) / 2);
+    h = GST_ROUND_UP_2 (imgb->h[0]) / 2;
+    w = GST_ROUND_UP_2 (imgb->w[0]) / 2;
+    /* Cb plane copy */
+    for (i = 0; i < h; i++)
+    {
+        memcpy (temp_outbuf + i * stride, imgb->a[1] + i * imgb->s[1], w);
+    }
+
+    temp_outbuf += GST_ROUND_UP_4 (GST_ROUND_UP_2 (imgb->w[0]) / 2) * (GST_ROUND_UP_2 (imgb->h[0]) / 2);
+    /* Same stride, height, width as above */
+    /* Cr plane copy */
+    for (i = 0; i < h; i++)
+    {
+        memcpy (temp_outbuf + i * stride, imgb->a[2] + i * imgb->s[2], w);
+    }
+
+    outsize  = imgb->w[0] * imgb->h[0]* 3 >> 1;
+    xvimagesink->xvimage->size = MIN(outsize, xvimagesink->xvimage->size);
+
+    GST_DEBUG("End");
+}
+#endif
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+static gboolean gst_xvimagesink_make_flush_buffer(GstXvImageSink *xvimagesink)
+{
+  GstXvImageFlushBuffer *flush_buffer = NULL;
+  GstXvImageDisplayingBuffer *display_buffer = NULL;
+  tbm_bo bo = NULL;
+  int size = 0;
+  int i = 0;
+  int ret = 0;
+
+  if (xvimagesink == NULL) {
+    GST_ERROR("handle is NULL");
+    return FALSE;
+  }
+
+  if (xvimagesink->last_added_buffer_index == -1) {
+    GST_WARNING_OBJECT(xvimagesink, "there is no remained buffer");
+    return FALSE;
+  }
+
+  if (xvimagesink->drm_fd < 0 || xvimagesink->bufmgr == NULL) {
+    GST_ERROR_OBJECT(xvimagesink, "drm fd[%d] or bufmgr[%p] is invalid",
+                                  xvimagesink->drm_fd, xvimagesink->bufmgr);
+    return FALSE;
+  }
+
+  flush_buffer = (GstXvImageFlushBuffer *)malloc(sizeof(GstXvImageFlushBuffer));
+  if (flush_buffer == NULL) {
+    GST_ERROR_OBJECT(xvimagesink, "GstXvImageFlushBuffer alloc failed");
+    return FALSE;
+  }
+
+  memset(flush_buffer, 0x0, sizeof(GstXvImageFlushBuffer));
+
+  display_buffer = &(xvimagesink->displaying_buffers[xvimagesink->last_added_buffer_index]);
+  GST_WARNING_OBJECT(xvimagesink, "last_added_buffer_index [%d]",
+                                  xvimagesink->last_added_buffer_index);
+
+  for (i = 0 ; i < XV_BUF_PLANE_NUM ; i++) {
+    if (display_buffer->bo[i]) {
+      tbm_bo_handle vaddr_src;
+      tbm_bo_handle vaddr_dst;
+
+      /* get bo size */
+      size = tbm_bo_size(display_buffer->bo[i]);
+
+      /* alloc bo */
+      bo = tbm_bo_alloc(xvimagesink->bufmgr, size, TBM_BO_DEFAULT);
+      if (bo == NULL) {
+        GST_ERROR_OBJECT(xvimagesink, "bo alloc[%d] failed", size);
+        goto FLUSH_BUFFER_FAILED;
+      }
+
+      GST_WARNING_OBJECT(xvimagesink, "[%d] bo %p, size %d alloc done", i, bo, size);
+
+      flush_buffer->gem_name[i] = tbm_bo_export(bo);
+      flush_buffer->bo[i] = bo;
+
+      /* get virtual address */
+      vaddr_src = tbm_bo_map(display_buffer->bo[i], TBM_DEVICE_CPU, TBM_OPTION_READ|TBM_OPTION_WRITE);
+      vaddr_dst = tbm_bo_map(bo, TBM_DEVICE_CPU, TBM_OPTION_READ|TBM_OPTION_WRITE);
+      if (vaddr_src.ptr == NULL || vaddr_dst.ptr == NULL) {
+        GST_WARNING_OBJECT(xvimagesink, "get vaddr failed src %p, dst %p",
+                                        vaddr_src.ptr, vaddr_dst.ptr);
+        if (vaddr_src.ptr) {
+          tbm_bo_unmap(display_buffer->bo[i]);
+        }
+        if (vaddr_dst.ptr) {
+          tbm_bo_unmap(bo);
+        }
+        goto FLUSH_BUFFER_FAILED;
+      }
+
+      /* copy buffer */
+      memcpy(vaddr_dst.ptr, vaddr_src.ptr, size);
+
+      tbm_bo_unmap(display_buffer->bo[i]);
+      tbm_bo_unmap(bo);
+
+      GST_WARNING_OBJECT(xvimagesink, "[%d] copy done", i);
+
+      xvimagesink->flush_buffer = flush_buffer;
+
+      ret = TRUE;
+    }
+  }
+
+  return ret;
+
+FLUSH_BUFFER_FAILED:
+  if (flush_buffer) {
+    for (i = 0 ; i < XV_BUF_PLANE_NUM ; i++) {
+      if (flush_buffer->bo[i]) {
+        tbm_bo_unref(flush_buffer->bo[i]);
+        flush_buffer->bo[i] = NULL;
+      }
+    }
+    free(flush_buffer);
+    flush_buffer = NULL;
+  }
+
+  return FALSE;
+}
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
+
 static GstFlowReturn
 gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
 {
   GstXvImageSink *xvimagesink;
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-  XV_PUTIMAGE_DATA_PTR img_data = NULL;
+  XV_DATA_PTR img_data = NULL;
   SCMN_IMGB *scmn_imgb = NULL;
   gint format = 0;
+  gboolean ret = FALSE;
+  int res = -1;
+  int (*handler) (Display *, XErrorEvent *) = NULL;
+  Atom atom_overlay;
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   xvimagesink = GST_XVIMAGESINK (vsink);
@@ -3126,6 +5308,9 @@ gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
      put the ximage which is in the PRIVATE pointer */
   if (GST_IS_XVIMAGE_BUFFER (buf)) {
     GST_LOG_OBJECT (xvimagesink, "fast put of bufferpool buffer %p", buf);
+#ifdef GST_EXT_XV_ENHANCEMENT
+    xvimagesink->xid_updated = FALSE;
+#endif /* GST_EXT_XV_ENHANCEMENT */
     if (!gst_xvimagesink_xvimage_put (xvimagesink,
             GST_XVIMAGE_BUFFER_CAST (buf)))
       goto no_window;
@@ -3134,21 +5319,41 @@ gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
         "slow copy into bufferpool buffer %p", buf);
     /* Else we have to copy the data into our private image, */
     /* if we have one... */
-    if (!xvimagesink->xvimage) {
-      GST_DEBUG_OBJECT (xvimagesink, "creating our xvimage");
+#ifdef GST_EXT_XV_ENHANCEMENT
+    g_mutex_lock (xvimagesink->flow_lock);
+    if (xvimagesink->skip_frame_due_to_external_dev) {
+      GST_WARNING_OBJECT( xvimagesink, "skip_frame_due_to_external_dev is TRUE. so skip show frame..." );
+      xvimagesink->skip_frame_due_to_external_dev = FALSE;
+      g_mutex_unlock (xvimagesink->flow_lock);
+      return GST_FLOW_OK;
+    }
+
+#endif /* GST_EXT_XV_ENHANCEMENT */
+      if (!xvimagesink->xvimage
+#ifdef GST_EXT_XV_ENHANCEMENT
+      && !xvimagesink->is_subpicture_format
+#endif
+        ) {
+        GST_DEBUG_OBJECT (xvimagesink, "creating our xvimage");
 
 #ifdef GST_EXT_XV_ENHANCEMENT
       format = gst_xvimagesink_get_format_from_caps(xvimagesink, GST_BUFFER_CAPS(buf));
       switch (format) {
         case GST_MAKE_FOURCC('S', 'T', '1', '2'):
         case GST_MAKE_FOURCC('S', 'N', '1', '2'):
+        case GST_MAKE_FOURCC('S', 'N', '2', '1'):
         case GST_MAKE_FOURCC('S', '4', '2', '0'):
         case GST_MAKE_FOURCC('S', 'U', 'Y', '2'):
         case GST_MAKE_FOURCC('S', 'U', 'Y', 'V'):
         case GST_MAKE_FOURCC('S', 'Y', 'V', 'Y'):
+        case GST_MAKE_FOURCC('I', 'T', 'L', 'V'):
+        case GST_MAKE_FOURCC('S', 'R', '3', '2'):
+        case GST_MAKE_FOURCC('S', 'V', '1', '2'):
+          xvimagesink->is_zero_copy_format = TRUE;
           scmn_imgb = (SCMN_IMGB *)GST_BUFFER_MALLOCDATA(buf);
           if(scmn_imgb == NULL) {
             GST_DEBUG_OBJECT( xvimagesink, "scmn_imgb is NULL. Skip xvimage put..." );
+            g_mutex_unlock (xvimagesink->flow_lock);
             return GST_FLOW_OK;
           }
 
@@ -3158,6 +5363,7 @@ gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
             GST_WARNING_OBJECT(xvimagesink, "invalid size[caps:%dx%d,aligned:%dx%d]. Skip this buffer...",
                                             xvimagesink->video_width, xvimagesink->video_height,
                                             scmn_imgb->s[0], scmn_imgb->e[0]);
+            g_mutex_unlock (xvimagesink->flow_lock);
             return GST_FLOW_OK;
           }
 
@@ -3167,9 +5373,12 @@ gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
                                        xvimagesink->aligned_width, xvimagesink->aligned_height);
           break;
         default:
+          xvimagesink->is_zero_copy_format = FALSE;
           GST_INFO_OBJECT(xvimagesink, "Use original width,height of caps");
           break;
       }
+
+      GST_INFO("zero copy format - %d", xvimagesink->is_zero_copy_format);
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
       xvimagesink->xvimage = gst_xvimagesink_xvimage_new (xvimagesink,
@@ -3179,7 +5388,14 @@ gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
         /* The create method should have posted an informative error */
         goto no_image;
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+      if ((xvimagesink->is_zero_copy_format == FALSE &&
+           xvimagesink->xvimage->size < GST_BUFFER_SIZE (buf)) ||
+          (xvimagesink->is_zero_copy_format &&
+           xvimagesink->xvimage->size < sizeof(SCMN_IMGB))) {
+#else /* GST_EXT_XV_ENHANCEMENT */
       if (xvimagesink->xvimage->size < GST_BUFFER_SIZE (buf)) {
+#endif /* GST_EXT_XV_ENHANCEMENT */
         GST_ELEMENT_ERROR (xvimagesink, RESOURCE, WRITE,
             ("Failed to create output image buffer of %dx%d pixels",
                 xvimagesink->xvimage->width, xvimagesink->xvimage->height),
@@ -3192,61 +5408,232 @@ gst_xvimagesink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
     }
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-    switch (xvimagesink->xvimage->im_format) {
+    if (xvimagesink->is_zero_copy_format) {
       /* Cases for specified formats of Samsung extension */
-      case GST_MAKE_FOURCC('S', 'T', '1', '2'):
-      case GST_MAKE_FOURCC('S', 'N', '1', '2'):
-      case GST_MAKE_FOURCC('S', '4', '2', '0'):
-      case GST_MAKE_FOURCC('S', 'U', 'Y', '2'):
-      case GST_MAKE_FOURCC('S', 'U', 'Y', 'V'):
-      case GST_MAKE_FOURCC('S', 'Y', 'V', 'Y'):
-      case GST_MAKE_FOURCC('I', 'T', 'L', 'V'):
-      {
-        GST_DEBUG("Samsung extension display format activated. fourcc:%d,display mode:%d,Rotate angle:%d",
-                  xvimagesink->xvimage->im_format, xvimagesink->display_mode, xvimagesink->rotate_angle);
+        GST_LOG("Samsung EXT format - fourcc:%c%c%c%c, display mode:%d, Rotate angle:%d",
+                xvimagesink->xvimage->im_format, xvimagesink->xvimage->im_format>>8,
+                xvimagesink->xvimage->im_format>>16, xvimagesink->xvimage->im_format>>24,
+                xvimagesink->display_mode, xvimagesink->rotate_angle);
 
         if (xvimagesink->xvimage->xvimage->data) {
-          img_data = (XV_PUTIMAGE_DATA_PTR) xvimagesink->xvimage->xvimage->data;
-          XV_PUTIMAGE_INIT_DATA(img_data);
+          int i = 0;
+          img_data = (XV_DATA_PTR) xvimagesink->xvimage->xvimage->data;
+          memset(img_data, 0x0, sizeof(XV_DATA));
+          XV_INIT_DATA(img_data);
 
           scmn_imgb = (SCMN_IMGB *)GST_BUFFER_MALLOCDATA(buf);
           if (scmn_imgb == NULL) {
             GST_DEBUG_OBJECT( xvimagesink, "scmn_imgb is NULL. Skip xvimage put..." );
+            g_mutex_unlock (xvimagesink->flow_lock);
             return GST_FLOW_OK;
           }
 
-          img_data->YPhyAddr  = (unsigned int)scmn_imgb->p[0];
-          img_data->CbPhyAddr = (unsigned int)scmn_imgb->p[1];
-          img_data->CrPhyAddr = (unsigned int)scmn_imgb->p[2];
+          /* Keep the vaddr of current image for copying last image */
+          if (scmn_imgb->buf_share_method != BUF_SHARE_METHOD_FLUSH_BUFFER) {
+            for(i = 0; i < SCMN_IMGB_MAX_PLANE; i++) {
+              xvimagesink->last_image_vaddr[i] = (unsigned int)scmn_imgb->a[i];
+            }
+            GST_LOG("Vaddr - YBuf[0x%x], CbBuf[0x%x], CrBuf[0x%x]",
+              xvimagesink->last_image_vaddr[0], xvimagesink->last_image_vaddr[1], xvimagesink->last_image_vaddr[2]);
+          }
 
-          GST_LOG_OBJECT(xvimagesink, "Ypaddr[%p],CbPaddr[%p],CrPaddr[%p]",
-                                      img_data->YPhyAddr, img_data->CbPhyAddr, img_data->CrPhyAddr );
+          if (scmn_imgb->buf_share_method == BUF_SHARE_METHOD_PADDR) {
+            img_data->YBuf = (unsigned int)scmn_imgb->p[0];
+            img_data->CbBuf = (unsigned int)scmn_imgb->p[1];
+            img_data->CrBuf = (unsigned int)scmn_imgb->p[2];
+            img_data->BufType = XV_BUF_TYPE_LEGACY;
 
-          img_data->RotAngle = xvimagesink->rotate_angle;
-          img_data->VideoMode = xvimagesink->display_mode;
+            GST_DEBUG("YBuf[0x%x], CbBuf[0x%x], CrBuf[0x%x]",
+                      img_data->YBuf, img_data->CbBuf, img_data->CrBuf );
+          } else if (scmn_imgb->buf_share_method == BUF_SHARE_METHOD_FD ||
+                     scmn_imgb->buf_share_method == BUF_SHARE_METHOD_TIZEN_BUFFER) {
+            gboolean do_set_secure = FALSE;
+
+            /* open drm to use gem */
+            if (xvimagesink->drm_fd < 0) {
+              drm_init(xvimagesink);
+            }
+
+            if (scmn_imgb->buf_share_method == BUF_SHARE_METHOD_FD) {
+              /* keep dma-buf fd. fd will be converted in gst_xvimagesink_xvimage_put */
+              img_data->dmabuf_fd[0] = scmn_imgb->dmabuf_fd[0];
+              img_data->dmabuf_fd[1] = scmn_imgb->dmabuf_fd[1];
+              img_data->dmabuf_fd[2] = scmn_imgb->dmabuf_fd[2];
+              img_data->BufType = XV_BUF_TYPE_DMABUF;
+              GST_DEBUG("DMABUF fd %u,%u,%u", img_data->dmabuf_fd[0], img_data->dmabuf_fd[1], img_data->dmabuf_fd[2]);
+            } else {
+              /* keep bo. bo will be converted in gst_xvimagesink_xvimage_put */
+              img_data->bo[0] = scmn_imgb->bo[0];
+              img_data->bo[1] = scmn_imgb->bo[1];
+              img_data->bo[2] = scmn_imgb->bo[2];
+              GST_DEBUG("TBM bo %p %p %p", img_data->bo[0], img_data->bo[1], img_data->bo[2]);
+            }
+
+            /* check secure contents path */
+            if (scmn_imgb->tz_enable) {
+              if (xvimagesink->secure_path != SECURE_PATH_ON) {
+                xvimagesink->secure_path = SECURE_PATH_ON;
+                do_set_secure = TRUE;
+              }
+            } else {
+              if (xvimagesink->secure_path != SECURE_PATH_OFF) {
+                xvimagesink->secure_path = SECURE_PATH_OFF;
+                do_set_secure = TRUE;
+              }
+            }
+            static gboolean is_exist = FALSE;
+            gchar *attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_SECURE");
+            is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+            g_free(attr_name);
+
+            if (do_set_secure && is_exist) {
+              Atom atom_secure = None;
+              g_mutex_lock (xvimagesink->x_lock);
+              atom_secure = XInternAtom(xvimagesink->xcontext->disp, "_USER_WM_PORT_ATTRIBUTE_SECURE", False);
+              if (atom_secure != None) {
+                if (XvSetPortAttribute(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_secure, xvimagesink->secure_path) != Success) {
+                  GST_ERROR_OBJECT(xvimagesink, "%d: XvSetPortAttribute: secure setting failed.", atom_secure);
+                } else {
+                  GST_WARNING_OBJECT(xvimagesink, "set contents path [%d] (0:NORMAL, 1:SECURE)", xvimagesink->secure_path);
+                }
+                XSync (xvimagesink->xcontext->disp, FALSE);
+              } else {
+                GST_ERROR_OBJECT(xvimagesink, "_USER_WM_PORT_ATTRIBUTE_SECURE is not existed");
+              }
+              g_mutex_unlock (xvimagesink->x_lock);
+            }
+
+            is_exist = FALSE;
+            attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_DRM_LEVEL");
+            is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+            g_free(attr_name);
+
+
+            if (xvimagesink->drm_level && is_exist) {
+              Atom atom_drm = None;
+              g_mutex_lock (xvimagesink->x_lock);
+              atom_drm = XInternAtom( xvimagesink->xcontext->disp,
+                                          "_USER_WM_PORT_ATTRIBUTE_DRM_LEVEL", False);
+              if (atom_drm != None) {
+                GST_INFO_OBJECT(xvimagesink, "DRM LEVEL -> 1");
+                if (XvSetPortAttribute(xvimagesink->xcontext->disp,
+                                     xvimagesink->xcontext->xv_port_id,
+                                     atom_drm, xvimagesink->drm_level ) != Success) {
+                  GST_WARNING_OBJECT( xvimagesink, "Set DRM LEVEL 1 failed" );
+                }
+                XSync (xvimagesink->xcontext->disp, FALSE);
+                g_mutex_unlock (xvimagesink->x_lock);
+                xvimagesink->drm_level = DRM_LEVEL_0;
+              }
+            }
+
+            /* set current buffer */
+            xvimagesink->xvimage->current_buffer = buf;
+          } else if (scmn_imgb->buf_share_method == BUF_SHARE_METHOD_FLUSH_BUFFER) {
+            /* Flush Buffer, we are going to push a new buffer for recieving return buffer event from X */
+            GST_WARNING_OBJECT(xvimagesink, "BUF_SHARE_METHOD_FLUSH_BUFFER case");
+            if (gst_xvimagesink_make_flush_buffer(xvimagesink)) {
+              img_data->bo[0] = xvimagesink->flush_buffer->bo[0];
+              img_data->bo[1] = xvimagesink->flush_buffer->bo[1];
+              img_data->bo[2] = xvimagesink->flush_buffer->bo[2];
+            } else {
+              g_mutex_unlock(xvimagesink->flow_lock);
+              return GST_FLOW_OK;
+            }
+          } else {
+            GST_WARNING("unknown buf_share_method type [%d]. skip xvimage put...",
+                        scmn_imgb->buf_share_method);
+            g_mutex_unlock (xvimagesink->flow_lock);
+            return GST_FLOW_OK;
+          }
         } else {
           GST_WARNING_OBJECT( xvimagesink, "xvimage->data is NULL. skip xvimage put..." );
+          g_mutex_unlock (xvimagesink->flow_lock);
           return GST_FLOW_OK;
         }
-        break;
+    } else if (xvimagesink->is_subpicture_format) {
+      GC gc;
+      xvimagesink->pixmap_for_subpicture = (Pixmap)GST_BUFFER_DATA(buf);
+      if(!xvimagesink->pixmap_for_subpicture) {
+        GST_ERROR("no pixmap");
+        g_mutex_unlock (xvimagesink->flow_lock);
+        return GST_FLOW_OK;
       }
-      default:
+      if(xvimagesink->video_width!=xvimagesink->external_width || xvimagesink->video_height!=xvimagesink->external_height) {
+        GST_ERROR("pixmap's size and current resolution are different");
+        g_mutex_unlock (xvimagesink->flow_lock);
+        return GST_FLOW_OK;
+      }
+      gc = XCreateGC (xvimagesink->xcontext->disp, xvimagesink->pixmap_for_subpicture, 0, 0);
+
+      GST_WARNING_OBJECT(xvimagesink, "xvimagesink pixmap ID : %p, port : %ld, GC : %p", xvimagesink->pixmap_for_subpicture,
+        xvimagesink->xcontext->xv_port_id, gc);
+
+      /* set error handler */
+      error_caught = FALSE;
+      handler = XSetErrorHandler(gst_xvimagesink_handle_xerror);
+
+      if(!xvimagesink->set_overlay_for_subpicture_just_once)
       {
-        GST_DEBUG("Normal format activated. fourcc = %d", xvimagesink->xvimage->im_format);
-        memcpy (xvimagesink->xvimage->xvimage->data,
-        GST_BUFFER_DATA (buf),
-        MIN (GST_BUFFER_SIZE (buf), xvimagesink->xvimage->size));
-        break;
+        GST_LOG("setting attribute overlay");
+        atom_overlay = XInternAtom (xvimagesink->xcontext->disp, "_USER_WM_PORT_ATTRIBUTE_OVERLAY", FALSE);
+        XvSetPortAttribute (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_overlay, 1);
+        XSync (xvimagesink->xcontext->disp, FALSE);
+        xvimagesink->set_overlay_for_subpicture_just_once = TRUE;
       }
+      res = XvGetStill(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id,
+        xvimagesink->pixmap_for_subpicture, gc, 0, 0, xvimagesink->external_width, xvimagesink->external_height,
+        0, 0, xvimagesink->external_width, xvimagesink->external_height);
+      XSync (xvimagesink->xcontext->disp, FALSE);
+
+      GST_WARNING_OBJECT(xvimagesink, "BUFFER TS=%" GST_TIME_FORMAT ", DUR=%" GST_TIME_FORMAT ", SIZE=%d\n",
+                          GST_TIME_ARGS(GST_BUFFER_TIMESTAMP(buf)),
+                          GST_TIME_ARGS(GST_BUFFER_DURATION(buf)),
+                          GST_BUFFER_SIZE(buf));
+      if(gc) {
+        GST_DEBUG("FreeGC");
+        XFreeGC (xvimagesink->xcontext->disp, gc);
+      }
+      if (error_caught)
+        GST_WARNING_OBJECT(xvimagesink, "XvGetStill error");
+      else
+        GST_WARNING_OBJECT(xvimagesink, "XvGetStill %s  ==> (width : %d, height : %d)", res == 0 ? "SUCCESS" : "FAIL", xvimagesink->external_width, xvimagesink->external_height);
+
+      /* Reset error handler */
+      if (handler) {
+        error_caught = FALSE;
+        XSetErrorHandler (handler);
+      }
+    } else {
+        GST_DEBUG("Normal format activated. fourcc = %d", xvimagesink->xvimage->im_format);
+
+#ifdef GST_EXT_ENABLE_HEVC
+        if(xvimagesink->need_combine_data == 1)
+        {
+            gst_xvimagesink_combine_i420_scmn_data(xvimagesink, buf);
+        }
+        else
+#endif
+        {
+            memcpy (xvimagesink->xvimage->xvimage->data,
+            GST_BUFFER_DATA (buf),
+            MIN (GST_BUFFER_SIZE (buf), xvimagesink->xvimage->size));
+        }
+    }
+
+    g_mutex_unlock (xvimagesink->flow_lock);
+    ret = gst_xvimagesink_xvimage_put(xvimagesink, xvimagesink->xvimage);
+    if (!ret && !xvimagesink->is_subpicture_format) {
+      goto no_window;
     }
 #else /* GST_EXT_XV_ENHANCEMENT */
     memcpy (xvimagesink->xvimage->xvimage->data,
         GST_BUFFER_DATA (buf),
         MIN (GST_BUFFER_SIZE (buf), xvimagesink->xvimage->size));
-#endif /* GST_EXT_XV_ENHANCEMENT */
 
     if (!gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage))
       goto no_window;
+#endif /* GST_EXT_XV_ENHANCEMENT */
   }
 
   return GST_FLOW_OK;
@@ -3256,6 +5643,9 @@ no_image:
   {
     /* No image available. That's very bad ! */
     GST_WARNING_OBJECT (xvimagesink, "could not create image");
+#ifdef GST_EXT_XV_ENHANCEMENT
+    g_mutex_unlock (xvimagesink->flow_lock);
+#endif
     return GST_FLOW_ERROR;
   }
 no_window:
@@ -3270,6 +5660,11 @@ static gboolean
 gst_xvimagesink_event (GstBaseSink * sink, GstEvent * event)
 {
   GstXvImageSink *xvimagesink = GST_XVIMAGESINK (sink);
+  if(GST_EVENT_TYPE (event) == GST_EVENT_NEWSEGMENT)
+  {
+      if(vconf_set_int(VCONFKEY_XV_STATE, (xvimagesink->eos_received << 2) | XV_STATUS_SEEK))
+        GST_WARNING("vconf set fail");
+  }
 
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_TAG:{
@@ -3280,14 +5675,76 @@ gst_xvimagesink_event (GstBaseSink * sink, GstEvent * event)
       gst_tag_list_get_string (l, GST_TAG_TITLE, &title);
 
       if (title) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+        if (!xvimagesink->get_pixmap_cb) {
+#endif
         GST_DEBUG_OBJECT (xvimagesink, "got tags, title='%s'", title);
         gst_xvimagesink_xwindow_set_title (xvimagesink, xvimagesink->xwindow,
             title);
 
         g_free (title);
+#ifdef GST_EXT_XV_ENHANCEMENT
+        }
+#endif
       }
       break;
     }
+#ifdef GST_EXT_XV_ENHANCEMENT
+    case GST_EVENT_FLUSH_START:
+      GST_DEBUG_OBJECT (xvimagesink, "flush start");
+      break;
+    case GST_EVENT_FLUSH_STOP:
+      GST_DEBUG_OBJECT (xvimagesink, "flush stop");
+      xvimagesink->is_during_seek = TRUE;
+      break;
+    case GST_EVENT_CUSTOM_DOWNSTREAM:
+    {
+      const GstStructure *st = NULL;
+      st = gst_event_get_structure (event);
+      if(!st) {
+        GST_WARNING_OBJECT (xvimagesink, "could not get structure for custom downstream event");
+      } else {
+        if (gst_structure_has_name (st, "Content_Is_DRM_Playready")) {
+          GST_INFO_OBJECT (xvimagesink, "got a event for DRM playready");
+          xvimagesink->drm_level = DRM_LEVEL_1;
+          if (xvimagesink->drm_level && xvimagesink->xcontext) {
+            static gboolean is_exist = FALSE;
+            gchar *attr_name = g_strdup("_USER_WM_PORT_ATTRIBUTE_DRM_LEVEL");
+            is_exist = check_supportable_port_attr(xvimagesink, attr_name);
+            g_free(attr_name);
+
+            if(is_exist)
+            {
+              Atom atom_drm = None;
+              g_mutex_lock (xvimagesink->x_lock);
+              atom_drm = XInternAtom( xvimagesink->xcontext->disp,
+                                          "_USER_WM_PORT_ATTRIBUTE_DRM_LEVEL", False);
+              if (atom_drm != None) {
+                GST_INFO_OBJECT(xvimagesink, "DRM LEVEL -> 1");
+                if (XvSetPortAttribute(xvimagesink->xcontext->disp,
+                                     xvimagesink->xcontext->xv_port_id,
+                                     atom_drm, xvimagesink->drm_level ) != Success) {
+                  GST_WARNING_OBJECT( xvimagesink, "Set DRM LEVEL 1 failed" );
+                }
+                XSync (xvimagesink->xcontext->disp, FALSE);
+                xvimagesink->drm_level = DRM_LEVEL_0;
+              }
+              g_mutex_unlock (xvimagesink->x_lock);
+            }
+          }
+        }
+      }
+      break;
+    }
+    case GST_EVENT_EOS:
+      xvimagesink->eos_received = TRUE;
+      GST_DEBUG_OBJECT(xvimagesink, "got eos");
+      break;
+    case GST_EVENT_NEWSEGMENT:
+      xvimagesink->eos_received = FALSE;
+      GST_DEBUG_OBJECT(xvimagesink, "got newsegment event");
+      break;
+#endif
     default:
       break;
   }
@@ -3509,6 +5966,12 @@ reuse_last_caps:
   }
 
   if (!xvimage) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+    /* init aligned size */
+    xvimagesink->aligned_width = 0;
+    xvimagesink->aligned_height = 0;
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
     /* We found no suitable image in the pool. Creating... */
     GST_DEBUG_OBJECT (xvimagesink, "no usable image in pool, creating xvimage");
     xvimage = gst_xvimagesink_xvimage_new (xvimagesink, intersection);
@@ -3652,19 +6115,137 @@ gst_xvimagesink_navigation_init (GstNavigationInterface * iface)
   iface->send_event = gst_xvimagesink_navigation_send_event;
 }
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+static void
+gst_xvimagesink_set_pixmap_handle (GstXOverlay * overlay, guintptr id)
+{
+  XID pixmap_id = id;
+  int i = 0;
+  GstXvImageSink *xvimagesink = GST_XVIMAGESINK (overlay);
+  GstXPixmap *xpixmap = NULL;
+  int (*handler) (Display *, XErrorEvent *);
+
+  g_return_if_fail (GST_IS_XVIMAGESINK (xvimagesink));
+
+  if (xvimagesink->subpicture)
+   return;
+
+  /* If the element has not initialized the X11 context try to do so */
+  if (!xvimagesink->xcontext && !(xvimagesink->xcontext = gst_xvimagesink_xcontext_get (xvimagesink))) {
+    /* we have thrown a GST_ELEMENT_ERROR now */
+    return;
+  }
+
+  gst_xvimagesink_update_colorbalance (xvimagesink);
+
+  GST_DEBUG_OBJECT( xvimagesink, "pixmap id : %d", pixmap_id );
+
+  /* if the returned pixmap_id is 0, set current pixmap index to -2 to skip putImage() */
+  if (pixmap_id == 0) {
+    xvimagesink->current_pixmap_idx = -2;
+    return;
+  }
+
+  g_mutex_lock (xvimagesink->x_lock);
+
+  for (i = 0; i < MAX_PIXMAP_NUM; i++) {
+    if (!xvimagesink->xpixmap[i]) {
+      Window root_window;
+      int cur_win_x = 0;
+      int cur_win_y = 0;
+      unsigned int cur_win_width = 0;
+      unsigned int cur_win_height = 0;
+      unsigned int cur_win_border_width = 0;
+      unsigned int cur_win_depth = 0;
+
+      GST_INFO_OBJECT( xvimagesink, "xpixmap[%d] is empty, create it with pixmap_id(%d)", i, pixmap_id );
+
+      xpixmap = g_new0 (GstXPixmap, 1);
+      if (xpixmap) {
+        xpixmap->pixmap = pixmap_id;
+
+        /* Get root window and size of current window */
+        XGetGeometry(xvimagesink->xcontext->disp, xpixmap->pixmap, &root_window,
+                     &cur_win_x, &cur_win_y, /* relative x, y */
+                     &cur_win_width, &cur_win_height,
+                     &cur_win_border_width, &cur_win_depth);
+        if (!cur_win_width || !cur_win_height) {
+          GST_INFO_OBJECT( xvimagesink, "cur_win_width(%d) or cur_win_height(%d) is null..", cur_win_width, cur_win_height );
+          g_mutex_unlock (xvimagesink->x_lock);
+          return;
+        }
+        xpixmap->width = cur_win_width;
+        xpixmap->height = cur_win_height;
+
+        if (!xvimagesink->render_rect.w)
+          xvimagesink->render_rect.w = cur_win_width;
+        if (!xvimagesink->render_rect.h)
+          xvimagesink->render_rect.h = cur_win_height;
+
+        /* Setting an error handler to catch failure */
+        error_caught = FALSE;
+        handler = XSetErrorHandler (gst_xvimagesink_handle_xerror);
+
+        /* Create a GC */
+        xpixmap->gc = XCreateGC (xvimagesink->xcontext->disp, xpixmap->pixmap, 0, NULL);
+
+        XSync(xvimagesink->xcontext->disp, FALSE);
+        if (error_caught) {
+          GST_ERROR_OBJECT(xvimagesink, "XCreateGC failed [gc:0x%x, pixmap id:%d]", xpixmap->gc, xpixmap->pixmap);
+        }
+        if (handler) {
+          error_caught = FALSE;
+          XSetErrorHandler (handler);
+        }
+
+        xvimagesink->xpixmap[i] = xpixmap;
+        xvimagesink->current_pixmap_idx = i;
+      } else {
+        GST_ERROR("failed to create xpixmap errno: %d", errno);
+      }
+
+      g_mutex_unlock (xvimagesink->x_lock);
+      return;
+
+    } else if (xvimagesink->xpixmap[i]->pixmap == pixmap_id) {
+      GST_DEBUG_OBJECT( xvimagesink, "found xpixmap[%d]->pixmap : %d", i, pixmap_id );
+      xvimagesink->current_pixmap_idx = i;
+
+      g_mutex_unlock (xvimagesink->x_lock);
+      return;
+
+    } else {
+      continue;
+    }
+  }
+
+  GST_ERROR_OBJECT( xvimagesink, "could not find the pixmap id(%d) in xpixmap array", pixmap_id );
+  xvimagesink->current_pixmap_idx = -1;
+
+  g_mutex_unlock (xvimagesink->x_lock);
+  return;
+}
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
 static void
 gst_xvimagesink_set_window_handle (GstXOverlay * overlay, guintptr id)
 {
   XID xwindow_id = id;
   GstXvImageSink *xvimagesink = GST_XVIMAGESINK (overlay);
   GstXWindow *xwindow = NULL;
+#ifdef GST_EXT_XV_ENHANCEMENT
+  GstState current_state = GST_STATE_NULL;
+  int (*handler) (Display *, XErrorEvent *);
+#endif /* GST_EXT_XV_ENHANCEMENT */
 
   g_return_if_fail (GST_IS_XVIMAGESINK (xvimagesink));
 
   g_mutex_lock (xvimagesink->flow_lock);
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-  GST_INFO_OBJECT( xvimagesink, "ENTER, id : %d", xwindow_id );
+  gst_element_get_state(GST_ELEMENT(xvimagesink), &current_state, NULL, 0);
+  GST_WARNING_OBJECT(xvimagesink, "ENTER, id : %d, current state : %d",
+                                  xwindow_id, current_state);
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   /* If we already use that window return */
@@ -3722,7 +6303,8 @@ gst_xvimagesink_set_window_handle (GstXOverlay * overlay, guintptr id)
     /* Set the event we want to receive and create a GC */
     g_mutex_lock (xvimagesink->x_lock);
 
-    XGetWindowAttributes (xvimagesink->xcontext->disp, xwindow->win, &attr);
+    if(!xvimagesink->is_pixmap)
+      XGetWindowAttributes (xvimagesink->xcontext->disp, xwindow->win, &attr);
 
     xwindow->width = attr.width;
     xwindow->height = attr.height;
@@ -3733,20 +6315,59 @@ gst_xvimagesink_set_window_handle (GstXOverlay * overlay, guintptr id)
       xvimagesink->render_rect.h = attr.height;
     }
     if (xvimagesink->handle_events) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+      XSelectInput (xvimagesink->xcontext->disp, xvimagesink->xcontext->root, StructureNotifyMask | SubstructureNotifyMask);
+      XSelectInput (xvimagesink->xcontext->disp, xwindow->win, ExposureMask |
+          StructureNotifyMask | PointerMotionMask | KeyPressMask |
+          KeyReleaseMask | PropertyChangeMask);
+#else
       XSelectInput (xvimagesink->xcontext->disp, xwindow->win, ExposureMask |
           StructureNotifyMask | PointerMotionMask | KeyPressMask |
           KeyReleaseMask);
-    }
+#endif
 
+    }
+#ifdef GST_EXT_XV_ENHANCEMENT
+    /* Setting an error handler to catch failure */
+    error_caught = FALSE;
+    handler = XSetErrorHandler (gst_xvimagesink_handle_xerror);
+#endif
     xwindow->gc = XCreateGC (xvimagesink->xcontext->disp,
         xwindow->win, 0, NULL);
+#ifdef GST_EXT_XV_ENHANCEMENT
+    XSync(xvimagesink->xcontext->disp, FALSE);
+    if (error_caught) {
+      GST_ERROR_OBJECT(xvimagesink, "XCreateGC failed [gc:0x%x, xid:%d]", xwindow->gc, xwindow->win);
+    }
+    if (handler) {
+      error_caught = FALSE;
+      XSetErrorHandler (handler);
+    }
+#endif
     g_mutex_unlock (xvimagesink->x_lock);
   }
 
   if (xwindow)
     xvimagesink->xwindow = xwindow;
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+  xvimagesink->xid_updated = TRUE;
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
   g_mutex_unlock (xvimagesink->flow_lock);
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (current_state == GST_STATE_PAUSED) {
+    GstBuffer *last_buffer = NULL;
+    g_object_get(G_OBJECT(xvimagesink), "last-buffer", &last_buffer, NULL);
+    GST_WARNING_OBJECT(xvimagesink, "PASUED state: window handle is updated. last buffer %p", last_buffer);
+    if (last_buffer) {
+      gst_xvimagesink_show_frame((GstVideoSink *)xvimagesink, last_buffer);
+      gst_buffer_unref(last_buffer);
+      last_buffer = NULL;
+    }
+  }
+#endif /* GST_EXT_XV_ENHANCEMENT */
 }
 
 static void
@@ -3756,11 +6377,9 @@ gst_xvimagesink_expose (GstXOverlay * overlay)
 
   gst_xvimagesink_xwindow_update_geometry (xvimagesink);
 #ifdef GST_EXT_XV_ENHANCEMENT
-  GST_INFO_OBJECT( xvimagesink, "Overlay window exposed. update it");
-  gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage);
-#else /* GST_EXT_XV_ENHANCEMENT */
-  gst_xvimagesink_xvimage_put (xvimagesink, NULL);
+  GST_INFO_OBJECT(xvimagesink, "Overlay window exposed. update it");
 #endif /* GST_EXT_XV_ENHANCEMENT */
+  gst_xvimagesink_xvimage_put (xvimagesink, NULL);
 }
 
 static void
@@ -3782,12 +6401,26 @@ gst_xvimagesink_set_event_handling (GstXOverlay * overlay,
 
   if (handle_events) {
     if (xvimagesink->xwindow->internal) {
+#ifdef GST_EXT_XV_ENHANCEMENT
+      XSelectInput (xvimagesink->xcontext->disp, xvimagesink->xcontext->root, StructureNotifyMask | SubstructureNotifyMask);
+#endif
       XSelectInput (xvimagesink->xcontext->disp, xvimagesink->xwindow->win,
+#ifdef GST_EXT_XV_ENHANCEMENT
+          ExposureMask | StructureNotifyMask | PointerMotionMask | VisibilityChangeMask | PropertyChangeMask |
+#else /* GST_EXT_XV_ENHANCEMENT */
           ExposureMask | StructureNotifyMask | PointerMotionMask |
+#endif /* GST_EXT_XV_ENHANCEMENT */
           KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask);
     } else {
+#ifdef GST_EXT_XV_ENHANCEMENT
+      XSelectInput (xvimagesink->xcontext->disp, xvimagesink->xcontext->root, StructureNotifyMask | SubstructureNotifyMask);
+#endif
       XSelectInput (xvimagesink->xcontext->disp, xvimagesink->xwindow->win,
+#ifdef GST_EXT_XV_ENHANCEMENT
+          ExposureMask | StructureNotifyMask | PointerMotionMask | VisibilityChangeMask | PropertyChangeMask |
+#else /* GST_EXT_XV_ENHANCEMENT */
           ExposureMask | StructureNotifyMask | PointerMotionMask |
+#endif /* GST_EXT_XV_ENHANCEMENT */
           KeyPressMask | KeyReleaseMask);
     }
   } else {
@@ -4162,25 +6795,52 @@ gst_xvimagesink_set_property (GObject * object, guint prop_id,
     case PROP_DISPLAY_MODE:
     {
       int set_mode = g_value_get_enum (value);
+      g_mutex_lock(xvimagesink->flow_lock);
+      xvimagesink->display_mode = set_mode;
+      if(!xvimagesink->get_pixmap_cb && !xvimagesink->subpicture) {
+        if(xvimagesink->display_mode==DISPLAY_MODE_PRI_VIDEO_OFF_AND_SEC_VIDEO_FULL_SCREEN) {
+          if(!xvimagesink->is_multi_window || (GST_STATE(xvimagesink) == GST_STATE_PLAYING)) {
+            set_display_mode(xvimagesink->xcontext, xvimagesink->display_mode);
+          } else {
+            GST_WARNING_OBJECT(xvimagesink, "display-mode will be set later. just save value now(%d)", xvimagesink->display_mode);
+          }
+        } else if(xvimagesink->display_mode==DISPLAY_MODE_PRI_VIDEO_ON_AND_SEC_VIDEO_CLONE){
+          if(xvimagesink->is_multi_window && (GST_STATE(xvimagesink) != GST_STATE_PLAYING)) {
+            set_display_mode(xvimagesink->xcontext, xvimagesink->display_mode);
+          } else {
+            GST_WARNING_OBJECT(xvimagesink, "display-mode will be set later. just save value now(%d)", xvimagesink->display_mode);
+          }
+        } else {
+          GST_WARNING_OBJECT(xvimagesink, "unsupported format(%d)", xvimagesink->display_mode);
+        }
+      }
+      g_mutex_unlock(xvimagesink->flow_lock);
+    }
+      break;
+    case PROP_CSC_RANGE:
+    {
+      int set_range = g_value_get_enum (value);
 
       g_mutex_lock(xvimagesink->flow_lock);
       g_mutex_lock(xvimagesink->x_lock);
 
-      if (xvimagesink->display_mode != set_mode) {
-        if (xvimagesink->xcontext) {
-          /* set display mode */
-          if (set_display_mode(xvimagesink->xcontext, set_mode)) {
-            xvimagesink->display_mode = set_mode;
+      if (xvimagesink->csc_range != set_range) {
+        if (xvimagesink->xcontext && !xvimagesink->subpicture) {
+          /* set color space range */
+          if (set_csc_range(xvimagesink->xcontext, set_range)) {
+            xvimagesink->csc_range = set_range;
           } else {
-            GST_WARNING_OBJECT(xvimagesink, "display mode[%d] set failed.", set_mode);
+            GST_WARNING_OBJECT(xvimagesink, "csc range[%d] set failed.", set_range);
           }
         } else {
           /* "xcontext" is not created yet. It will be applied when xcontext is created. */
-          GST_INFO_OBJECT(xvimagesink, "xcontext is NULL. display-mode will be set later.");
-          xvimagesink->display_mode = set_mode;
+          GST_INFO_OBJECT(xvimagesink, "xcontext is NULL. color space range will be set later.");
+          xvimagesink->csc_range = set_range;
         }
+      } else if (xvimagesink->subpicture) {
+        GST_WARNING("skip to set csc range, because it is subpicture format.");
       } else {
-        GST_INFO_OBJECT(xvimagesink, "skip display mode %d, because current mode is same", set_mode);
+        GST_INFO_OBJECT(xvimagesink, "skip to set csc range %d, because current is same", set_range);
       }
 
       g_mutex_unlock(xvimagesink->x_lock);
@@ -4190,44 +6850,86 @@ gst_xvimagesink_set_property (GObject * object, guint prop_id,
     case PROP_DISPLAY_GEOMETRY_METHOD:
       xvimagesink->display_geometry_method = g_value_get_enum (value);
       GST_LOG("Overlay geometry changed. update it");
-      gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage);
+      if (GST_STATE(xvimagesink) == GST_STATE_PAUSED || xvimagesink->eos_received) {
+        gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage);
+      }
+      break;
+    case PROP_FLIP:
+      xvimagesink->flip = g_value_get_enum(value);
       break;
     case PROP_ROTATE_ANGLE:
       xvimagesink->rotate_angle = g_value_get_enum (value);
-      xvimagesink->rotate_changed = TRUE;
+      if (GST_STATE(xvimagesink) == GST_STATE_PAUSED || xvimagesink->eos_received) {
+        gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage);
+      }
       break;
     case PROP_VISIBLE:
       g_mutex_lock( xvimagesink->flow_lock );
       g_mutex_lock( xvimagesink->x_lock );
 
-      if (xvimagesink->visible && (g_value_get_boolean(value) == FALSE)) {
-        Atom atom_stream = XInternAtom( xvimagesink->xcontext->disp,
-                                        "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", False );
-        if (atom_stream != None) {
-          if (XvSetPortAttribute(xvimagesink->xcontext->disp,
-                                 xvimagesink->xcontext->xv_port_id,
-                                 atom_stream, 0 ) != Success) {
-            GST_WARNING_OBJECT( xvimagesink, "Set visible FALSE failed" );
-          }
+      GST_WARNING_OBJECT(xvimagesink, "set visible %d", g_value_get_boolean(value));
 
+      if (xvimagesink->visible && (g_value_get_boolean(value) == FALSE)) {
+        if (xvimagesink->xcontext) {
+#if 0
+          Atom atom_stream = XInternAtom( xvimagesink->xcontext->disp,
+                                          "_USER_WM_PORT_ATTRIBUTE_STREAM_OFF", False );
+          if (atom_stream != None) {
+            GST_WARNING_OBJECT(xvimagesink, "Visible FALSE -> CALL STREAM_OFF");
+            if (XvSetPortAttribute(xvimagesink->xcontext->disp,
+                                   xvimagesink->xcontext->xv_port_id,
+                                   atom_stream, 0 ) != Success) {
+              GST_WARNING_OBJECT( xvimagesink, "Set visible FALSE failed" );
+            }
+          }
+#endif
+          xvimagesink->visible = g_value_get_boolean (value);
+          if ( xvimagesink->get_pixmap_cb ) {
+            if (xvimagesink->xpixmap[0] && xvimagesink->xpixmap[0]->pixmap) {
+              XvStopVideo (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xpixmap[0]->pixmap);
+              }
+          } else {
+            if(xvimagesink->xwindow->win)
+              XvStopVideo(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xwindow->win);
+          }
           XSync( xvimagesink->xcontext->disp, FALSE );
+        } else {
+          GST_WARNING_OBJECT( xvimagesink, "xcontext is null");
+          xvimagesink->visible = g_value_get_boolean (value);
         }
       } else if (!xvimagesink->visible && (g_value_get_boolean(value) == TRUE)) {
+        xvimagesink->visible = g_value_get_boolean (value);
         g_mutex_unlock( xvimagesink->x_lock );
         g_mutex_unlock( xvimagesink->flow_lock );
-        GST_INFO_OBJECT( xvimagesink, "Set visible as TRUE. Update it." );
         gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage);
         g_mutex_lock( xvimagesink->flow_lock );
         g_mutex_lock( xvimagesink->x_lock );
       }
 
-      xvimagesink->visible = g_value_get_boolean (value);
+      GST_INFO("set visible(%d) done", xvimagesink->visible);
 
       g_mutex_unlock( xvimagesink->x_lock );
       g_mutex_unlock( xvimagesink->flow_lock );
       break;
     case PROP_ZOOM:
-      xvimagesink->zoom = g_value_get_int (value);
+      xvimagesink->zoom = g_value_get_float (value);
+      break;
+    case PROP_ZOOM_POS_X:
+      xvimagesink->zoom_pos_x = g_value_get_int (value);
+      break;
+    case PROP_ZOOM_POS_Y:
+      xvimagesink->zoom_pos_y = g_value_get_int (value);
+      if (GST_STATE(xvimagesink) == GST_STATE_PAUSED || xvimagesink->eos_received) {
+        gst_xvimagesink_xvimage_put (xvimagesink, xvimagesink->xvimage);
+      }
+      break;
+    case PROP_ORIENTATION:
+      xvimagesink->orientation = g_value_get_enum (value);
+      GST_INFO("Orientation(%d) is changed", xvimagesink->orientation);
+      break;
+    case PROP_DST_ROI_MODE:
+      xvimagesink->dst_roi_mode = g_value_get_enum (value);
+      GST_INFO("Overlay geometry(%d) for ROI is changed", xvimagesink->dst_roi_mode);
       break;
     case PROP_DST_ROI_X:
       xvimagesink->dst_roi.x = g_value_get_int (value);
@@ -4241,18 +6943,134 @@ gst_xvimagesink_set_property (GObject * object, guint prop_id,
     case PROP_DST_ROI_H:
       xvimagesink->dst_roi.h = g_value_get_int (value);
       break;
+    case PROP_SRC_CROP_X:
+      xvimagesink->src_crop.x = g_value_get_int (value);
+      break;
+    case PROP_SRC_CROP_Y:
+      xvimagesink->src_crop.y = g_value_get_int (value);
+      break;
+    case PROP_SRC_CROP_W:
+      xvimagesink->src_crop.w = g_value_get_int (value);
+      break;
+    case PROP_SRC_CROP_H:
+      xvimagesink->src_crop.h = g_value_get_int (value);
+      break;
     case PROP_STOP_VIDEO:
       xvimagesink->stop_video = g_value_get_int (value);
       g_mutex_lock( xvimagesink->flow_lock );
 
       if( xvimagesink->stop_video )
       {
-        GST_INFO_OBJECT( xvimagesink, "Xwindow CLEAR when set video-stop property" );
-        gst_xvimagesink_xwindow_clear (xvimagesink, xvimagesink->xwindow);
+        if ( xvimagesink->get_pixmap_cb ) {
+          if (xvimagesink->xpixmap[0] && xvimagesink->xpixmap[0]->pixmap) {
+            g_mutex_lock (xvimagesink->x_lock);
+            GST_WARNING_OBJECT( xvimagesink, "calling XvStopVideo()" );
+            XvStopVideo (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xpixmap[0]->pixmap);
+            g_mutex_unlock (xvimagesink->x_lock);
+          }
+        } else {
+          GST_INFO_OBJECT( xvimagesink, "Xwindow CLEAR when set video-stop property" );
+          gst_xvimagesink_xwindow_clear (xvimagesink, xvimagesink->xwindow);
+        }
       }
 
       g_mutex_unlock( xvimagesink->flow_lock );
       break;
+    case PROP_PIXMAP_CB:
+    {
+      void *cb_func;
+      cb_func = g_value_get_pointer(value);
+      if (cb_func) {
+        if (xvimagesink->get_pixmap_cb) {
+          int i = 0;
+          if (xvimagesink->xpixmap[0] && xvimagesink->xpixmap[0]->pixmap) {
+            g_mutex_lock (xvimagesink->x_lock);
+            GST_WARNING_OBJECT( xvimagesink, "calling XvStopVideo()" );
+            XvStopVideo (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xpixmap[0]->pixmap);
+            g_mutex_unlock (xvimagesink->x_lock);
+          }
+          for (i = 0; i < MAX_PIXMAP_NUM; i++) {
+            if (xvimagesink->xpixmap[i]) {
+              gst_xvimagesink_xpixmap_destroy (xvimagesink, xvimagesink->xpixmap[i]);
+              xvimagesink->xpixmap[i] = NULL;
+            }
+          }
+        }
+        xvimagesink->get_pixmap_cb = cb_func;
+        GST_INFO_OBJECT (xvimagesink, "Set callback(0x%x) for getting pixmap id", xvimagesink->get_pixmap_cb);
+      }
+      break;
+    }
+    case PROP_PIXMAP_CB_USER_DATA:
+    {
+      void *user_data;
+      user_data = g_value_get_pointer(value);
+      if (user_data) {
+        xvimagesink->get_pixmap_cb_user_data = user_data;
+        GST_INFO_OBJECT (xvimagesink, "Set user data(0x%x) for getting pixmap id", xvimagesink->get_pixmap_cb_user_data);
+      }
+      break;
+    }
+    case PROP_SUBPICTURE:
+      xvimagesink->subpicture = g_value_get_boolean (value);
+    break;
+    case PROP_EXTERNAL_WIDTH:
+    {
+      xvimagesink->external_width = g_value_get_int (value);
+      GST_LOG("[set property] xvimagesink->external_width : %d", xvimagesink->external_width);
+      break;
+    }
+    case PROP_EXTERNAL_HEIGHT:
+    {
+      xvimagesink->external_height = g_value_get_int (value);
+      GST_LOG("[set property] xvimagesink->external_height : %d", xvimagesink->external_height);
+      break;
+    }
+    case PROP_ENABLE_FLUSH_BUFFER:
+      xvimagesink->enable_flush_buffer = g_value_get_boolean(value);
+      break;
+    case PROP_PIXMAP:
+      xvimagesink->is_pixmap = g_value_get_boolean(value);
+      break;
+    case PROP_HIDED_WINDOW:
+    {
+      xvimagesink->is_hided_subpicture = g_value_get_boolean(value);
+      GST_WARNING_OBJECT(xvimagesink, "update hided_window %d", xvimagesink->is_hided_subpicture);
+      break;
+    }
+    case PROP_QUICKPANEL_ON:
+    {
+      xvimagesink->is_quick_panel_on_subpicture = g_value_get_boolean(value);
+      GST_WARNING_OBJECT(xvimagesink, "update quick panel status %d", xvimagesink->is_quick_panel_on_subpicture);
+      break;
+    }
+    case PROP_MULTIWINDOW_ACTIVE:
+    {
+      xvimagesink->is_multi_window_subpicture = g_value_get_boolean(value);
+      GST_WARNING_OBJECT(xvimagesink, "update multi-window status %d", xvimagesink->is_multi_window_subpicture);
+      break;
+    }
+    case PROP_KEEP_EXTERNAL_FULLSCREEN_POST:
+    {
+      xvimagesink->keep_external_fullscreen_post = g_value_get_boolean(value);
+      GST_WARNING_OBJECT(xvimagesink, "set property %d for setting _USER_WM_PORT_ATTRIBUTE_KEEP_EXT", xvimagesink->keep_external_fullscreen_post);
+      if(xvimagesink->keep_external_fullscreen_post) {
+        Atom atom_keep_ext;
+        atom_keep_ext = XInternAtom (xvimagesink->xcontext->disp, "_USER_WM_PORT_ATTRIBUTE_KEEP_EXT", False);
+        if(XvSetPortAttribute (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, atom_keep_ext , 1) != Success)
+        {
+          GST_WARNING("set atom_keep_ext fail");
+        }
+      }
+      break;
+    }
+    case PROP_KEEP_EXTERNAL_FULLSCREEN_PREV:
+    {
+      xvimagesink->keep_external_fullscreen_prev = g_value_get_boolean(value);
+      GST_WARNING_OBJECT(xvimagesink, "set property %d for keeping external display to full screen", xvimagesink->keep_external_fullscreen_prev);
+      break;
+    }
+
 #endif /* GST_EXT_XV_ENHANCEMENT */
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -4346,8 +7164,14 @@ gst_xvimagesink_get_property (GObject * object, guint prop_id,
     case PROP_DISPLAY_MODE:
       g_value_set_enum (value, xvimagesink->display_mode);
       break;
+    case PROP_CSC_RANGE:
+      g_value_set_enum (value, xvimagesink->csc_range);
+      break;
     case PROP_DISPLAY_GEOMETRY_METHOD:
       g_value_set_enum (value, xvimagesink->display_geometry_method);
+      break;
+    case PROP_FLIP:
+      g_value_set_enum(value, xvimagesink->flip);
       break;
     case PROP_ROTATE_ANGLE:
       g_value_set_enum (value, xvimagesink->rotate_angle);
@@ -4356,7 +7180,19 @@ gst_xvimagesink_get_property (GObject * object, guint prop_id,
       g_value_set_boolean (value, xvimagesink->visible);
       break;
     case PROP_ZOOM:
-      g_value_set_int (value, xvimagesink->zoom);
+      g_value_set_float (value, xvimagesink->zoom);
+      break;
+    case PROP_ZOOM_POS_X:
+      g_value_set_int (value, xvimagesink->zoom_pos_x);
+      break;
+    case PROP_ZOOM_POS_Y:
+      g_value_set_int (value, xvimagesink->zoom_pos_y);
+      break;
+    case PROP_ORIENTATION:
+      g_value_set_enum (value, xvimagesink->orientation);
+      break;
+    case PROP_DST_ROI_MODE:
+      g_value_set_enum (value, xvimagesink->dst_roi_mode);
       break;
     case PROP_DST_ROI_X:
       g_value_set_int (value, xvimagesink->dst_roi.x);
@@ -4370,9 +7206,57 @@ gst_xvimagesink_get_property (GObject * object, guint prop_id,
     case PROP_DST_ROI_H:
       g_value_set_int (value, xvimagesink->dst_roi.h);
       break;
+    case PROP_SRC_CROP_X:
+      g_value_set_int (value, xvimagesink->src_crop.x);
+      break;
+    case PROP_SRC_CROP_Y:
+      g_value_set_int (value, xvimagesink->src_crop.y);
+      break;
+    case PROP_SRC_CROP_W:
+      g_value_set_int (value, xvimagesink->src_crop.w);
+      break;
+    case PROP_SRC_CROP_H:
+      g_value_set_int (value, xvimagesink->src_crop.h);
+      break;
     case PROP_STOP_VIDEO:
       g_value_set_int (value, xvimagesink->stop_video);
       break;
+    case PROP_PIXMAP_CB:
+      g_value_set_pointer (value, xvimagesink->get_pixmap_cb);
+      break;
+    case PROP_PIXMAP_CB_USER_DATA:
+      g_value_set_pointer (value, xvimagesink->get_pixmap_cb_user_data);
+      break;
+    case PROP_SUBPICTURE:
+      g_value_set_boolean (value, xvimagesink->subpicture);
+      break;
+    case PROP_EXTERNAL_WIDTH:
+      g_value_set_int (value, xvimagesink->external_width);
+      break;
+    case PROP_EXTERNAL_HEIGHT:
+      g_value_set_int (value, xvimagesink->external_height);
+      break;
+    case PROP_ENABLE_FLUSH_BUFFER:
+      g_value_set_boolean(value, xvimagesink->enable_flush_buffer);
+      break;
+    case PROP_PIXMAP:
+      g_value_set_boolean(value, xvimagesink->is_pixmap);
+      break;
+    case PROP_HIDED_WINDOW:
+      g_value_set_boolean(value, xvimagesink->is_hided_subpicture);
+      break;
+    case PROP_QUICKPANEL_ON:
+      g_value_set_boolean(value, xvimagesink->is_quick_panel_on_subpicture);
+      break;
+    case PROP_MULTIWINDOW_ACTIVE:
+      g_value_set_boolean(value, xvimagesink->is_multi_window_subpicture);
+      break;
+    case PROP_KEEP_EXTERNAL_FULLSCREEN_POST:
+      g_value_set_boolean(value, xvimagesink->keep_external_fullscreen_post);
+     break;
+    case PROP_KEEP_EXTERNAL_FULLSCREEN_PREV:
+      g_value_set_boolean(value, xvimagesink->keep_external_fullscreen_prev);
+     break;
 #endif /* GST_EXT_XV_ENHANCEMENT */
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -4418,7 +7302,31 @@ gst_xvimagesink_reset (GstXvImageSink * xvimagesink)
     gst_xvimagesink_xwindow_destroy (xvimagesink, xvimagesink->xwindow);
     xvimagesink->xwindow = NULL;
   }
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if(xvimagesink->is_subpicture_format && xvimagesink->pixmap_for_subpicture) {
+      GST_INFO("calling XvStopVideo() for %d port [pixmap : %p]", xvimagesink->xcontext->xv_port_id, xvimagesink->pixmap_for_subpicture);
+      XvStopVideo(xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->pixmap_for_subpicture);
+      xvimagesink->pixmap_for_subpicture = 0;
+  }
 
+  if (xvimagesink->get_pixmap_cb) {
+    int i = 0;
+    if (xvimagesink->xpixmap[0] && xvimagesink->xpixmap[0]->pixmap) {
+      g_mutex_lock (xvimagesink->x_lock);
+      GST_WARNING_OBJECT( xvimagesink, "calling XvStopVideo()" );
+      XvStopVideo (xvimagesink->xcontext->disp, xvimagesink->xcontext->xv_port_id, xvimagesink->xpixmap[0]->pixmap);
+      g_mutex_unlock (xvimagesink->x_lock);
+    }
+    for (i = 0; i < MAX_PIXMAP_NUM; i++) {
+      if (xvimagesink->xpixmap[i]) {
+        gst_xvimagesink_xpixmap_destroy (xvimagesink, xvimagesink->xpixmap[i]);
+        xvimagesink->xpixmap[i] = NULL;
+      }
+    }
+    xvimagesink->get_pixmap_cb = NULL;
+    xvimagesink->get_pixmap_cb_user_data = NULL;
+  }
+#endif /* GST_EXT_XV_ENHANCEMENT */
   xvimagesink->render_rect.x = xvimagesink->render_rect.y =
       xvimagesink->render_rect.w = xvimagesink->render_rect.h = 0;
   xvimagesink->have_render_rect = FALSE;
@@ -4459,6 +7367,12 @@ gst_xvimagesink_finalize (GObject * object)
     g_mutex_free (xvimagesink->pool_lock);
     xvimagesink->pool_lock = NULL;
   }
+#ifdef GST_EXT_XV_ENHANCEMENT
+  if (xvimagesink->display_buffer_lock) {
+    g_mutex_free (xvimagesink->display_buffer_lock);
+    xvimagesink->display_buffer_lock = NULL;
+  }
+#endif /* GST_EXT_XV_ENHANCEMENT */
 
   g_free (xvimagesink->media_title);
 
@@ -4469,6 +7383,11 @@ static void
 gst_xvimagesink_init (GstXvImageSink * xvimagesink,
     GstXvImageSinkClass * xvimagesinkclass)
 {
+#ifdef GST_EXT_XV_ENHANCEMENT
+  int i;
+  int j;
+#endif /* GST_EXT_XV_ENHANCEMENT */
+
   xvimagesink->display_name = NULL;
   xvimagesink->adaptor_no = 0;
   xvimagesink->xcontext = NULL;
@@ -4508,17 +7427,27 @@ gst_xvimagesink_init (GstXvImageSink * xvimagesink,
   xvimagesink->draw_borders = TRUE;
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-  xvimagesink->display_mode = DISPLAY_MODE_DEFAULT;
-  xvimagesink->rotate_changed = TRUE;
+  xvimagesink->xid_updated = FALSE;
+  xvimagesink->display_mode = DISPLAY_MODE_PRI_VIDEO_ON_AND_SEC_VIDEO_CLONE;
+  xvimagesink->csc_range = CSC_RANGE_NARROW;
   xvimagesink->display_geometry_method = DEF_DISPLAY_GEOMETRY_METHOD;
+  xvimagesink->flip = DEF_DISPLAY_FLIP;
   xvimagesink->rotate_angle = DEGREE_270;
   xvimagesink->visible = TRUE;
-  xvimagesink->zoom = 1;
+  xvimagesink->zoom = 1.0;
+  xvimagesink->zoom_pos_x = -1;
+  xvimagesink->zoom_pos_y = -1;
   xvimagesink->rotation = -1;
+  xvimagesink->dst_roi_mode = DEF_ROI_DISPLAY_GEOMETRY_METHOD;
+  xvimagesink->orientation = DEGREE_0;
   xvimagesink->dst_roi.x = 0;
   xvimagesink->dst_roi.y = 0;
   xvimagesink->dst_roi.w = 0;
   xvimagesink->dst_roi.h = 0;
+  xvimagesink->src_crop.x = 0;
+  xvimagesink->src_crop.y = 0;
+  xvimagesink->src_crop.w = 0;
+  xvimagesink->src_crop.h = 0;
   xvimagesink->xim_transparenter = NULL;
   xvimagesink->scr_w = 0;
   xvimagesink->scr_h = 0;
@@ -4526,6 +7455,50 @@ gst_xvimagesink_init (GstXvImageSink * xvimagesink,
   xvimagesink->aligned_height = 0;
   xvimagesink->stop_video = FALSE;
   xvimagesink->is_hided = FALSE;
+  xvimagesink->is_quick_panel_on = FALSE;
+  xvimagesink->is_multi_window = FALSE;
+  xvimagesink->drm_fd = -1;
+  xvimagesink->current_pixmap_idx = -1;
+  xvimagesink->get_pixmap_cb = NULL;
+  xvimagesink->get_pixmap_cb_user_data = NULL;
+
+  for (i = 0 ; i < DISPLAYING_BUFFERS_MAX_NUM ; i++) {
+    xvimagesink->displaying_buffers[i].buffer = NULL;
+    for (j = 0 ; j < XV_BUF_PLANE_NUM ; j++) {
+      xvimagesink->displaying_buffers[i].gem_name[j] = 0;
+      xvimagesink->displaying_buffers[i].gem_handle[j] = 0;
+      xvimagesink->displaying_buffers[i].dmabuf_fd[j] = 0;
+      xvimagesink->displaying_buffers[i].ref_count = 0;
+    }
+  }
+
+  xvimagesink->display_buffer_lock = g_mutex_new ();
+
+  xvimagesink->displayed_buffer_count = 0;
+  xvimagesink->displaying_buffer_count = 0;
+  xvimagesink->is_zero_copy_format = FALSE;
+  xvimagesink->secure_path = SECURE_PATH_INIT;
+  xvimagesink->drm_level = DRM_LEVEL_0;
+  xvimagesink->last_added_buffer_index = -1;
+  xvimagesink->bufmgr = NULL;
+  xvimagesink->flush_buffer = NULL;
+  xvimagesink->enable_flush_buffer = TRUE;
+  xvimagesink->pixmap_for_subpicture = 0;
+  xvimagesink->is_subpicture_format = FALSE;
+  xvimagesink->set_overlay_for_subpicture_just_once = FALSE;
+  xvimagesink->subpicture = FALSE;
+  xvimagesink->external_width = 0;
+  xvimagesink->external_height = 0;
+  xvimagesink->skip_frame_due_to_external_dev = FALSE;
+  xvimagesink->is_hided_subpicture = FALSE;
+  xvimagesink->is_quick_panel_on_subpicture = FALSE;
+  xvimagesink->is_multi_window_subpicture = FALSE;
+  xvimagesink->keep_external_fullscreen_post = FALSE;
+  xvimagesink->keep_external_fullscreen_prev = FALSE;
+  if(!XInitThreads())
+    GST_WARNING("FAIL to call XInitThreads()");
+  if(vconf_set_int(VCONFKEY_XV_STATE, (xvimagesink->eos_received << 2) | XV_STATUS_NULL))
+    GST_WARNING("vconf set fail");
 #endif /* GST_EXT_XV_ENHANCEMENT */
 }
 
@@ -4600,6 +7573,14 @@ gst_xvimagesink_class_init (GstXvImageSinkClass * klass)
       g_param_spec_string ("device-name", "Adaptor name",
           "The name of the video adaptor", NULL,
           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_EXTERNAL_WIDTH,
+      g_param_spec_int ("external-width", "external width",
+          "width of external display", 0, G_MAXINT,
+          0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_EXTERNAL_HEIGHT,
+      g_param_spec_int ("external-height", "external height",
+          "height of external display", 0, G_MAXINT,
+          0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   /**
    * GstXvImageSink:handle-expose
    *
@@ -4694,7 +7675,18 @@ gst_xvimagesink_class_init (GstXvImageSinkClass * klass)
   g_object_class_install_property(gobject_class, PROP_DISPLAY_MODE,
     g_param_spec_enum("display-mode", "Display Mode",
       "Display device setting",
-      GST_TYPE_XVIMAGESINK_DISPLAY_MODE, DISPLAY_MODE_DEFAULT,
+      GST_TYPE_XVIMAGESINK_DISPLAY_MODE, DISPLAY_MODE_PRI_VIDEO_ON_AND_SEC_VIDEO_CLONE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:csc-range
+   *
+   * select color space range
+   */
+  g_object_class_install_property(gobject_class, PROP_CSC_RANGE,
+    g_param_spec_enum("csc-range", "Color Space Range",
+      "Color space range setting",
+      GST_TYPE_XVIMAGESINK_CSC_RANGE, CSC_RANGE_NARROW,
       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /**
@@ -4706,6 +7698,17 @@ gst_xvimagesink_class_init (GstXvImageSinkClass * klass)
     g_param_spec_enum("display-geometry-method", "Display geometry method",
       "Geometrical method for display",
       GST_TYPE_XVIMAGESINK_DISPLAY_GEOMETRY_METHOD, DEF_DISPLAY_GEOMETRY_METHOD,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:display-flip
+   *
+   * Display flip setting
+   */
+  g_object_class_install_property(gobject_class, PROP_FLIP,
+    g_param_spec_enum("flip", "Display flip",
+      "Flip for display",
+      GST_TYPE_XVIMAGESINK_FLIP, DEF_DISPLAY_FLIP,
       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /**
@@ -4732,12 +7735,54 @@ gst_xvimagesink_class_init (GstXvImageSinkClass * klass)
   /**
    * GstXvImageSink:zoom
    *
-   * Scale small area of screen to 2X, 3X, ... , 9X
+   * Scale small area of screen to 1X~ 9X
    */
   g_object_class_install_property (gobject_class, PROP_ZOOM,
-      g_param_spec_int ("zoom", "Zoom",
-          "Zooms screen as nX", 1, 9, 1,
+      g_param_spec_float ("zoom", "Zoom",
+          "Zooms screen as nX", 1.0, 9.0, 1.0,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:zoom-pos-x
+   *
+   * Standard x-position of zoom
+   */
+  g_object_class_install_property (gobject_class, PROP_ZOOM_POS_X,
+      g_param_spec_int ("zoom-pos-x", "Zoom Position X",
+          "Standard x-position of zoom", -1, 3840, -1,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:zoom-pos-y
+   *
+   * Standard y-position of zoom
+   */
+  g_object_class_install_property (gobject_class, PROP_ZOOM_POS_Y,
+      g_param_spec_int ("zoom-pos-y", "Zoom Position Y",
+          "Standard y-position of zoom", -1, 3840, -1,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:dst-roi-mode
+   *
+   * Display geometrical method of ROI setting
+   */
+  g_object_class_install_property(gobject_class, PROP_DST_ROI_MODE,
+    g_param_spec_enum("dst-roi-mode", "Display geometry method of ROI",
+      "Geometrical method of ROI for display",
+      GST_TYPE_XVIMAGESINK_ROI_DISPLAY_GEOMETRY_METHOD, DEF_ROI_DISPLAY_GEOMETRY_METHOD,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:orientation
+   *
+   * Orientation information which will be used for ROI/ZOOM
+   */
+  g_object_class_install_property(gobject_class, PROP_ORIENTATION,
+    g_param_spec_enum("orientation", "Orientation information used for ROI/ZOOM",
+      "Orientation information for display",
+      GST_TYPE_XVIMAGESINK_ROTATE_ANGLE, DEGREE_0,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /**
    * GstXvImageSink:dst-roi-x
@@ -4788,6 +7833,220 @@ gst_xvimagesink_class_init (GstXvImageSinkClass * klass)
       g_param_spec_int ("stop-video", "Stop-Video",
           "Stop video for releasing video source buffer", 0, 1, 0,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_PIXMAP_CB,
+      g_param_spec_pointer("pixmap-id-callback", "Pixmap-Id-Callback",
+          "pointer of callback function for getting pixmap id", G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_PIXMAP_CB_USER_DATA,
+      g_param_spec_pointer("pixmap-id-callback-userdata", "Pixmap-Id-Callback-Userdata",
+          "pointer of user data of callback function for getting pixmap id", G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_SUBPICTURE,
+      g_param_spec_boolean ("subpicture", "Subpicture",
+          "identifier of player for supporting subpicture", FALSE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:src-crop-x
+   *
+   * X value of video source crop
+   */
+  g_object_class_install_property (gobject_class, PROP_SRC_CROP_X,
+      g_param_spec_int ("src-crop-x", "Source Crop X",
+          "X value of Video source crop(only available if LETTER_BOX or FULL_SCREEN mode)", 0, XV_SCREEN_SIZE_WIDTH, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:src-crop-y
+   *
+   * Y value of video source crop
+   */
+  g_object_class_install_property (gobject_class, PROP_SRC_CROP_Y,
+      g_param_spec_int ("src-crop-y", "Source Crop X",
+          "Y value of Video source crop(only available if LETTER_BOX or FULL_SCREEN mode)", 0, XV_SCREEN_SIZE_WIDTH, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:src-crop-w
+   *
+   * Width value of video source crop
+   */
+  g_object_class_install_property (gobject_class, PROP_SRC_CROP_W,
+      g_param_spec_int ("src-crop-w", "Source Crop Width",
+          "Width value of Video source crop(only available if LETTER_BOX or FULL_SCREEN mode)", 0, XV_SCREEN_SIZE_WIDTH, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:src-crop-h
+   *
+   * Height value of video source crop
+   */
+  g_object_class_install_property (gobject_class, PROP_SRC_CROP_H,
+      g_param_spec_int ("src-crop-h", "Source Crop Height",
+          "Height value of Video source crop(only available if LETTER_BOX or FULL_SCREEN mode)", 0, XV_SCREEN_SIZE_WIDTH, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:enable-flush-buffer
+   *
+   * Enable flush buffer mechanism when state change(PAUSED_TO_READY)
+   */
+  g_object_class_install_property (gobject_class, PROP_ENABLE_FLUSH_BUFFER,
+      g_param_spec_boolean("enable-flush-buffer", "Enable flush buffer mechanism",
+          "Enable flush buffer mechanism when state change(PAUSED_TO_READY)",
+          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:is-pixmap
+   *
+   * Check using pixmap id for blocking X api
+   */
+  g_object_class_install_property (gobject_class, PROP_PIXMAP,
+      g_param_spec_boolean("is-pixmap", "Check if use pixmap",
+          "Check using pixmap id for blocking X api",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:hided-window
+   *
+   * check window status for hiding subtitle
+   */
+  g_object_class_install_property (gobject_class, PROP_HIDED_WINDOW,
+      g_param_spec_boolean("hided-window", "Hided window",
+          "check window status for hiding subtitle",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:quick-panel-on
+   *
+   * check quick-panel status for hiding subtitle
+   */
+  g_object_class_install_property (gobject_class, PROP_QUICKPANEL_ON,
+      g_param_spec_boolean("quick-panel-on", "Quick panel On",
+          "check quick-panel status for hiding subtitle",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:multiwindow-activated
+   *
+   * check multiwindow-activated status for hiding subtitle
+   */
+  g_object_class_install_property (gobject_class, PROP_MULTIWINDOW_ACTIVE,
+      g_param_spec_boolean("multiwindow-active", "Multiwindow Activate",
+          "check multiwindow status for hiding subtitle",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:keep-external-fullscreen-post
+   *
+   * keep video-only mode for special case, it is set immediately.
+   */
+  g_object_class_install_property (gobject_class, PROP_KEEP_EXTERNAL_FULLSCREEN_POST,
+      g_param_spec_boolean("keep-external-fullscreen-post", "Keep external display to full screen",
+          "set video-only mode forcedly for special case",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink:keep-external-fullscreen-prev
+   *
+   * keep video-only mode for special case, it is set in advance.
+   */
+  g_object_class_install_property (gobject_class, PROP_KEEP_EXTERNAL_FULLSCREEN_PREV,
+      g_param_spec_boolean("keep-external-fullscreen-prev", "Keep external display to full screen",
+          "set video-only mode forcedly for special case",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstXvImageSink::frame-render-error
+   */
+  gst_xvimagesink_signals[SIGNAL_FRAME_RENDER_ERROR] = g_signal_new (
+          "frame-render-error",
+          G_TYPE_FROM_CLASS (klass),
+          G_SIGNAL_RUN_LAST,
+          0,
+          NULL,
+          NULL,
+          gst_xvimagesink_BOOLEAN__POINTER,
+          G_TYPE_BOOLEAN,
+          1,
+          G_TYPE_POINTER);
+  /**
+   * GstXvImageSink::display-status
+   */
+    gst_xvimagesink_signals[SIGNAL_DISPLAY_STATUS] = g_signal_new (
+          "display-status",
+          G_TYPE_FROM_CLASS (klass),
+          G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+          0,
+          NULL,
+          NULL,
+          g_cclosure_marshal_VOID__INT,
+          G_TYPE_NONE,
+          1,
+          G_TYPE_INT);
+
+  /**
+   * GstXvImageSink::external-resolution
+   */
+  gst_xvimagesink_signals[SIGNAL_EXTERNAL_RESOLUTION] = g_signal_new (
+          "external-resolution",
+         G_TYPE_FROM_CLASS (klass),
+         G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+         0,
+         NULL,
+         NULL,
+         gst_marshal_VOID__INT_INT,
+         G_TYPE_NONE,
+         2,
+         G_TYPE_INT,
+         G_TYPE_INT);
+
+  /**
+   * GstXvImageSink::hided-window
+   */
+    gst_xvimagesink_signals[SIGNAL_WINDOW_STATUS] = g_signal_new (
+          "hided-window",
+          G_TYPE_FROM_CLASS (klass),
+          G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+          0,
+          NULL,
+          NULL,
+          g_cclosure_marshal_VOID__BOOLEAN,
+          G_TYPE_NONE,
+          1,
+          G_TYPE_BOOLEAN);
+
+  /**
+   * GstXvImageSink::quick-panel-on
+   */
+    gst_xvimagesink_signals[SIGNAL_QUICKPANEL_STATUS] = g_signal_new (
+          "quick-panel-on",
+          G_TYPE_FROM_CLASS (klass),
+          G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+          0,
+          NULL,
+          NULL,
+          g_cclosure_marshal_VOID__BOOLEAN,
+          G_TYPE_NONE,
+          1,
+          G_TYPE_BOOLEAN);
+
+  /**
+   * GstXvImageSink::multiwindow-active
+   */
+    gst_xvimagesink_signals[SIGNAL_MULTIWINDOW_STATUS] = g_signal_new (
+          "multiwindow-active",
+          G_TYPE_FROM_CLASS (klass),
+          G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+          0,
+          NULL,
+          NULL,
+          g_cclosure_marshal_VOID__BOOLEAN,
+          G_TYPE_NONE,
+          1,
+          G_TYPE_BOOLEAN);
+
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
   gobject_class->finalize = gst_xvimagesink_finalize;
@@ -4879,3 +8138,5 @@ GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     "xvimagesink",
     "XFree86 video output plugin using Xv extension",
     plugin_init, VERSION, GST_LICENSE, GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
+
+

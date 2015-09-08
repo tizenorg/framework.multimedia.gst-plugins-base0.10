@@ -19,7 +19,7 @@
 
 #ifndef __GST_VIDEO_RATE_H__
 #define __GST_VIDEO_RATE_H__
-
+#define VIDEORATE_MODIFICATION
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
 

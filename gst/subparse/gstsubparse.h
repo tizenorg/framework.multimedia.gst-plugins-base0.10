@@ -24,6 +24,8 @@
 #include <gst/gst.h>
 #include <gst/base/gstadapter.h>
 
+#define SUBPARSE_MODIFICATION
+
 GST_DEBUG_CATEGORY_EXTERN (sub_parse_debug);
 #define GST_CAT_DEFAULT sub_parse_debug
 
@@ -68,6 +70,12 @@ typedef struct {
   gpointer user_data;
   gboolean have_internal_fps; /* If TRUE don't overwrite fps by property */
   gint fps_n, fps_d;     /* used by frame based parsers */
+#ifdef SUBPARSE_MODIFICATION
+  GList* language_list;
+  gchar* current_language;
+  gchar *msl_language;
+  gboolean langlist_msg_posted;
+#endif
 } ParserState;
 
 typedef gchar* (*Parser) (ParserState *state, const gchar *line);
@@ -99,6 +107,7 @@ struct _GstSubParse {
   gboolean      need_segment;
   
   gboolean flushing;
+  gboolean discont_sent;
   gboolean valid_utf8;
   gchar   *detected_encoding;
   gchar   *encoding;
@@ -106,7 +115,7 @@ struct _GstSubParse {
   gboolean first_buffer;
 
   /* used by frame based parsers */
-  gint fps_n, fps_d;          
+  gint fps_n, fps_d;
 };
 
 struct _GstSubParseClass {

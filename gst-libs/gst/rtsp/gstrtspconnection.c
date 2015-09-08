@@ -1409,9 +1409,9 @@ message_to_string (GstRTSPConnection * conn, GstRTSPMessage * message)
     case GST_RTSP_MESSAGE_REQUEST:
       /* create request string, add CSeq */
       g_string_append_printf (str, "%s %s RTSP/1.0\r\n"
-          "CSeq: %d\r\n",
-          gst_rtsp_method_as_text (message->type_data.request.method),
-          message->type_data.request.uri, conn->cseq++);
+      "CSeq: %d\r\n",
+      gst_rtsp_method_as_text (message->type_data.request.method),
+      message->type_data.request.uri, conn->cseq++);
       /* add session id if we have one */
       if (conn->session_id[0] != '\0') {
         gst_rtsp_message_remove_header (message, GST_RTSP_HDR_SESSION, -1);
@@ -1443,8 +1443,19 @@ message_to_string (GstRTSPConnection * conn, GstRTSPMessage * message)
       break;
     case GST_RTSP_MESSAGE_DATA:
     {
-      guint8 data_header[4];
+#ifdef SAMSUNG_WFD_SPEC
+      /* This change is made because WFD Sink does not understand the first 2
+      * bytes i.e (magic number and channel) of TCP Interleaved data. This
+      * is done specifically to support WFD Sink's limitation */
 
+      guint8 data_header[2];
+      data_header[0] = (message->body_size >> 8) & 0xff;
+      data_header[1] = message->body_size & 0xff;
+
+      /* create string with header and data */
+      str = g_string_append_len (str, (gchar *) data_header, 2);
+#else
+      guint8 data_header[4];
       /* prepare data header */
       data_header[0] = '$';
       data_header[1] = message->type_data.data.channel;
@@ -1453,6 +1464,7 @@ message_to_string (GstRTSPConnection * conn, GstRTSPMessage * message)
 
       /* create string with header and data */
       str = g_string_append_len (str, (gchar *) data_header, 4);
+#endif
       str =
           g_string_append_len (str, (gchar *) message->body,
           message->body_size);

@@ -36,15 +36,27 @@
 #include "mpl2parse.h"
 #include "qttextparse.h"
 
+#ifdef GST_EXT_ENABLE_SMI
+#ifdef GST_DISABLE_XML
+#undef GST_DISABLE_XML
+#endif
+#endif
+
 GST_DEBUG_CATEGORY (sub_parse_debug);
 
-#define DEFAULT_ENCODING   NULL
+#define DEFAULT_ENCODING           NULL
+#ifdef SUBPARSE_MODIFICATION
+#define DEFAULT_CURRENT_LANGUAGE   NULL
+#endif
 
 enum
 {
   PROP_0,
   PROP_ENCODING,
-  PROP_VIDEOFPS
+  PROP_VIDEOFPS,
+#ifdef SUBPARSE_MODIFICATION
+  PROP_EXTSUB_CURRENT_LANGUAGE
+#endif
 };
 
 static void
@@ -172,7 +184,12 @@ gst_sub_parse_dispose (GObject * object)
     g_string_free (subparse->textbuf, TRUE);
     subparse->textbuf = NULL;
   }
-
+#ifdef SUBPARSE_MODIFICATION
+  if (subparse->state.current_language) {
+    g_free (subparse->state.current_language);
+    subparse->state.current_language = NULL;
+  }
+#endif
   GST_CALL_PARENT (G_OBJECT_CLASS, dispose, (object));
 }
 
@@ -205,6 +222,13 @@ gst_sub_parse_class_init (GstSubParseClass * klass)
           "and the subtitle format requires it subtitles may be out of sync.",
           0, 1, G_MAXINT, 1, 24000, 1001,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+#ifdef SUBPARSE_MODIFICATION
+  g_object_class_install_property (object_class, PROP_EXTSUB_CURRENT_LANGUAGE,
+      g_param_spec_string ("current-language", "Current language",
+            "Current language of the subtitle in external subtitle case.",
+            DEFAULT_CURRENT_LANGUAGE,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+#endif
 }
 
 static void
@@ -227,6 +251,7 @@ gst_sub_parse_init (GstSubParse * subparse)
   subparse->textbuf = g_string_new (NULL);
   subparse->parser_type = GST_SUB_PARSE_FORMAT_UNKNOWN;
   subparse->flushing = FALSE;
+  subparse->discont_sent = FALSE;
   gst_segment_init (&subparse->segment, GST_FORMAT_TIME);
   subparse->need_segment = TRUE;
   subparse->encoding = g_strdup (DEFAULT_ENCODING);
@@ -319,24 +344,23 @@ gst_sub_parse_src_event (GstPad * pad, GstEvent * event)
         goto beach;
       }
 
+      /* Apply the seek to our segment */
+      gst_segment_set_seek (&self->segment, rate, format, self->segment_flags,
+          start_type, start, stop_type, stop, &update);
+
+      GST_DEBUG_OBJECT (self, "segment after seek: %" GST_SEGMENT_FORMAT,
+          &self->segment);
+
+      self->next_offset = 0;
+      self->need_segment = TRUE;
+
       /* Convert that seek to a seeking in bytes at position 0,
          FIXME: could use an index */
       ret = gst_pad_push_event (self->sinkpad,
           gst_event_new_seek (rate, GST_FORMAT_BYTES, self->segment_flags,
               GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_NONE, 0));
 
-      if (ret) {
-        /* Apply the seek to our segment */
-        gst_segment_set_seek (&self->segment, rate, format, self->segment_flags,
-            start_type, start, stop_type, stop, &update);
-
-        GST_DEBUG_OBJECT (self, "segment after seek: %" GST_SEGMENT_FORMAT,
-            &self->segment);
-
-        self->next_offset = 0;
-
-        self->need_segment = TRUE;
-      } else {
+      if (!ret) {
         GST_WARNING_OBJECT (self, "seek to 0 bytes failed");
       }
 
@@ -381,6 +405,16 @@ gst_sub_parse_set_property (GObject * object, guint prop_id,
       }
       break;
     }
+#ifdef SUBPARSE_MODIFICATION
+    case PROP_EXTSUB_CURRENT_LANGUAGE:
+      subparse->state.current_language = g_value_dup_string (value);
+      subparse->state.msl_language = g_value_dup_string (value);
+      GST_LOG_OBJECT (subparse, "subtitle current language set to %s",
+      GST_STR_NULL (subparse->state.current_language));
+      GST_LOG_OBJECT (subparse, "subtitle msl language set to %s",
+      GST_STR_NULL (subparse->state.msl_language));
+      break;
+#endif
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -402,6 +436,12 @@ gst_sub_parse_get_property (GObject * object, guint prop_id,
     case PROP_VIDEOFPS:
       gst_value_set_fraction (value, subparse->fps_n, subparse->fps_d);
       break;
+#ifdef SUBPARSE_MODIFICATION
+    case PROP_EXTSUB_CURRENT_LANGUAGE:
+      g_value_set_string (value, subparse->state.current_language);
+      GST_LOG("************getting property to %s*********************",subparse->state.current_language);
+      break;
+#endif
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -508,6 +548,10 @@ convert_encoding (GstSubParse * self, const gchar * str, gsize len,
     g_free (self->detected_encoding);
     self->detected_encoding = NULL;
     g_error_free (err);
+#ifdef SUBPARSE_MODIFICATION
+    /* You must ensure an error is NULL before it's set */
+    err = NULL;
+#endif
   }
 
   /* Otherwise check if it's UTF8 */
@@ -540,9 +584,22 @@ convert_encoding (GstSubParse * self, const gchar * str, gsize len,
     GST_WARNING_OBJECT (self, "could not convert string from '%s' to UTF-8: %s",
         encoding, err->message);
     g_error_free (err);
-
+#ifdef SUBPARSE_MODIFICATION
+    /* You must ensure an error is NULL before it's set */
+    err = NULL;
+    if(!strcmp(self->encoding,"EUC-KR"))
+     {
+        GST_WARNING("failback case is occure with EUC-KR,so going with CP949 ");
+        g_free(self->encoding);
+        self->encoding = g_strdup("CP949");
+        ret = gst_convert_to_utf8 (str, len, encoding, consumed, &err);
+      } else {
+#endif
     /* invalid input encoding, fall back to ISO-8859-15 (always succeeds) */
-    ret = gst_convert_to_utf8 (str, len, "ISO-8859-15", consumed, NULL);
+        ret = gst_convert_to_utf8 (str, len, "ISO-8859-15", consumed, NULL);
+#ifdef SUBPARSE_MODIFICATION
+      }
+#endif
   }
 
   GST_LOG_OBJECT (self,
@@ -1197,6 +1254,11 @@ parser_state_init (ParserState * state)
   state->max_duration = 0;      /* no limit */
   state->state = 0;
   state->segment = NULL;
+#ifdef SUBPARSE_MODIFICATION
+  state->language_list = NULL;
+  state->current_language = NULL;
+  state->langlist_msg_posted = FALSE;
+#endif
 }
 
 static void
@@ -1383,6 +1445,8 @@ gst_sub_parse_format_autodetect (GstSubParse * self)
     case GST_SUB_PARSE_FORMAT_SAMI:
       self->parse_line = parse_sami;
       sami_context_init (&self->state);
+      GST_LOG("************setting property to %s*********************", self->state.current_language);
+      sami_context_change_language (&self->state);
       return gst_caps_new_simple ("text/x-pango-markup", NULL);
 #endif
     case GST_SUB_PARSE_FORMAT_TMPLAYER:
@@ -1443,14 +1507,13 @@ feed_textbuf (GstSubParse * self, GstBuffer * buf)
 
   self->offset = GST_BUFFER_OFFSET (buf) + GST_BUFFER_SIZE (buf);
   self->next_offset = self->offset;
-
+  GST_INFO("Pushing in the adapter");
   gst_adapter_push (self->adapter, buf);
 
   input =
       convert_encoding (self, (const gchar *) gst_adapter_peek (self->adapter,
           gst_adapter_available (self->adapter)),
       (gsize) gst_adapter_available (self->adapter), &consumed);
-
   if (input && consumed > 0) {
     self->textbuf = g_string_append (self->textbuf, input);
     gst_adapter_flush (self->adapter, consumed);
@@ -1459,13 +1522,65 @@ feed_textbuf (GstSubParse * self, GstBuffer * buf)
   g_free (input);
 }
 
+#ifdef SUBPARSE_MODIFICATION
+static gchar*
+get_next_sami_sync_line (gchar * line, guint* offset)
+{
+  const char *line_end = NULL;
+  gchar* sync_line = NULL;
+  int have_r = 0;
+
+  line_end = strstr (line, "<SYNC");
+
+  if (!line_end ) {
+    /* <SYNC not found, or there is only one sync in this line return offset as 0 */
+    sync_line = (gchar*)g_malloc ((strlen(line)) + 1);
+    strcpy (sync_line, line);
+    *(sync_line + strlen(line)) = '\0';
+    *offset = 0;
+    return sync_line;
+  }
+
+  if (line_end == line)
+  {
+    const gchar* tempptr = line_end;
+    line_end += strlen("<SYNC");
+    line_end = strstr (line_end, "<SYNC");
+    if (!line_end ) {
+      /* <SYNC not found, or there is only one sync in this line return offset as 0 */
+      line_end = tempptr;
+      sync_line = g_strdup(line_end);
+      *offset = 0;
+      return sync_line;
+    }
+  }
+
+  /* get rid of '\r' */
+  if (line_end != line && *(line_end - 1) == '\r') {
+    line_end--;
+    have_r = 1;
+  }
+
+  *offset = line_end - line;
+
+  sync_line = g_strndup (line, *offset);
+
+  return sync_line;
+}
+#endif
+
 static GstFlowReturn
 handle_buffer (GstSubParse * self, GstBuffer * buf)
 {
   GstFlowReturn ret = GST_FLOW_OK;
   GstCaps *caps = NULL;
   gchar *line, *subtitle;
-
+#ifdef SUBPARSE_MODIFICATION
+  GstMessage *m = NULL;
+  guint counter = 0;
+#endif
+  gboolean discont = FALSE;
+  gboolean discont_after = FALSE;
   if (self->first_buffer) {
     self->detected_encoding =
         detect_encoding ((gchar *) GST_BUFFER_DATA (buf),
@@ -1474,7 +1589,17 @@ handle_buffer (GstSubParse * self, GstBuffer * buf)
     self->state.fps_n = self->fps_n;
     self->state.fps_d = self->fps_d;
   }
-
+  if (!strcmp ((const char*)GST_BUFFER_DATA (buf), "eos")){
+    GST_DEBUG_OBJECT(self,"eos buffer is recieved");
+      if (GST_BUFFER_FLAG_IS_SET(buf,GST_BUFFER_FLAG_GAP)) {
+      GST_DEBUG_OBJECT(self,"eos buffer with flag is recieved recieved");
+      ret = gst_pad_push (self->srcpad, buf);
+      return ret;
+    }
+  }
+  discont = GST_BUFFER_IS_DISCONT (buf);
+  if(discont)
+    self->discont_sent = FALSE;
   feed_textbuf (self, buf);
 
   /* make sure we know the format */
@@ -1501,9 +1626,161 @@ handle_buffer (GstSubParse * self, GstBuffer * buf)
 
   while (!self->flushing && (line = get_next_line (self))) {
     guint offset = 0;
-
+#ifdef SUBPARSE_MODIFICATION
+    guint suboffset = 0;
+    gchar* sync_line = NULL;
+#endif
     /* Set segment on our parser state machine */
     self->state.segment = &self->segment;
+#ifdef SUBPARSE_MODIFICATION
+    if (self->parser_type == GST_SUB_PARSE_FORMAT_SAMI) {
+      do {
+        /* Now parse the line, out of segment lines will just return NULL */
+        sync_line = get_next_sami_sync_line(line + offset, &suboffset);
+        offset += suboffset;
+        GST_LOG_OBJECT (self, "Parsing line '%s'", sync_line);
+        subtitle = self->parse_line (&self->state, sync_line);
+        g_free (sync_line);
+        sync_line = NULL;
+
+        if (!self->state.langlist_msg_posted && self->state.language_list) {
+          if(self->state.language_list) {
+            m = gst_message_new_element (GST_OBJECT_CAST (self), gst_structure_new("Ext_Sub_Language_List",
+                                       "lang_list", G_TYPE_POINTER, self->state.language_list, NULL));
+
+            gst_element_post_message (GST_ELEMENT_CAST (self), m);
+            self->state.langlist_msg_posted = TRUE;
+          }
+          GST_DEBUG_OBJECT (self, "LANGLIST POSTED with current language as : %s ",self->state.current_language);
+        }
+        GST_DEBUG_OBJECT (self, "parse_line returned %x", subtitle);
+
+        if (subtitle) {
+          guint subtitle_len = strlen (subtitle);
+
+          /* +1 for terminating NUL character */
+          ret = gst_pad_alloc_buffer_and_set_caps (self->srcpad,
+          GST_BUFFER_OFFSET_NONE, subtitle_len + 1,
+          GST_PAD_CAPS (self->srcpad), &buf);
+
+          if (ret == GST_FLOW_OK) {
+            /* copy terminating NUL character as well */
+            memcpy (GST_BUFFER_DATA (buf), subtitle, subtitle_len + 1);
+            GST_BUFFER_SIZE (buf) = subtitle_len;
+            GST_BUFFER_TIMESTAMP (buf) = self->state.start_time;
+            GST_BUFFER_DURATION (buf) = self->state.duration;
+            if (discont && !counter) {
+               GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+               GST_DEBUG("setting the true for discont flag and self is %p with ts is %" GST_TIME_FORMAT "\n",self,GST_TIME_ARGS(GST_BUFFER_TIMESTAMP (buf)));
+               self->discont_sent = TRUE;
+               counter++;
+             } else if (!self->discont_sent && !counter) {
+               GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+               GST_DEBUG("setting the true for discont flag and self is %p with ts is %" GST_TIME_FORMAT "\n",self,GST_TIME_ARGS(GST_BUFFER_TIMESTAMP (buf)));
+               self->discont_sent = TRUE;
+               counter++;
+             }
+
+            /* in some cases (e.g. tmplayer) we can only determine the duration
+             * of a text chunk from the timestamp of the next text chunk; in those
+             * cases, we probably want to limit the duration to something
+             * reasonable, so we don't end up showing some text for e.g. 40 seconds
+             * just because nothing else is being said during that time */
+            if (self->state.max_duration > 0 && GST_BUFFER_DURATION_IS_VALID (buf)) {
+              if (GST_BUFFER_DURATION (buf) > self->state.max_duration)
+                GST_BUFFER_DURATION (buf) = self->state.max_duration;
+            }
+
+            gst_segment_set_last_stop (&self->segment, GST_FORMAT_TIME, self->state.start_time);
+
+            GST_DEBUG_OBJECT (self, "Sending text '%s', %" GST_TIME_FORMAT " + %"
+                    GST_TIME_FORMAT, subtitle, GST_TIME_ARGS (self->state.start_time),
+                    GST_TIME_ARGS (self->state.duration));
+
+            ret = gst_pad_push (self->srcpad, buf);
+          }
+
+          /* move this forward (the tmplayer parser needs this) */
+          if (self->state.duration != GST_CLOCK_TIME_NONE)
+            self->state.start_time += self->state.duration;
+
+          g_free (subtitle);
+          subtitle = NULL;
+        }
+      } while (suboffset);
+      g_free (line);
+      line = NULL;
+    }
+
+    else {
+      /* Now parse the line, out of segment lines will just return NULL */
+      GST_LOG_OBJECT (self, "Parsing line '%s'", line + offset);
+      subtitle = self->parse_line (&self->state, line + offset);
+      g_free (line);
+
+      GST_DEBUG_OBJECT (self, "parse_line returned %x", subtitle);
+
+      if (subtitle) {
+        guint subtitle_len = strlen (subtitle);
+
+        /* +1 for terminating NUL character */
+        ret = gst_pad_alloc_buffer_and_set_caps (self->srcpad,
+                  GST_BUFFER_OFFSET_NONE, subtitle_len + 1,
+                  GST_PAD_CAPS (self->srcpad), &buf);
+
+        if (ret == GST_FLOW_OK) {
+          /* copy terminating NUL character as well */
+          memcpy (GST_BUFFER_DATA (buf), subtitle, subtitle_len + 1);
+          GST_BUFFER_SIZE (buf) = subtitle_len;
+          GST_BUFFER_TIMESTAMP (buf) = self->state.start_time;
+          GST_BUFFER_DURATION (buf) = self->state.duration;
+
+          /* in some cases (e.g. tmplayer) we can only determine the duration
+           * of a text chunk from the timestamp of the next text chunk; in those
+           * cases, we probably want to limit the duration to something
+           * reasonable, so we don't end up showing some text for e.g. 40 seconds
+           * just because nothing else is being said during that time */
+          if (self->state.max_duration > 0 && GST_BUFFER_DURATION_IS_VALID (buf)) {
+            if (GST_BUFFER_DURATION (buf) > self->state.max_duration)
+              GST_BUFFER_DURATION (buf) = self->state.max_duration;
+          }
+
+          gst_segment_set_last_stop (&self->segment, GST_FORMAT_TIME,
+              self->state.start_time);
+
+          GST_DEBUG_OBJECT (self, "Sending text '%s', %" GST_TIME_FORMAT " + %"
+              GST_TIME_FORMAT, subtitle, GST_TIME_ARGS (self->state.start_time),
+              GST_TIME_ARGS (self->state.duration));
+          if (discont && !counter) {
+             GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+             GST_DEBUG("setting the true for discont flag and self is %p with ts is %" GST_TIME_FORMAT "\n",self,GST_TIME_ARGS(GST_BUFFER_TIMESTAMP (buf)));
+             self->discont_sent = TRUE;
+             counter++;
+           } else if (!self->discont_sent && !counter) {
+             GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+             GST_DEBUG("setting the true for discont flag and self is %p with ts is %" GST_TIME_FORMAT "\n",self,GST_TIME_ARGS(GST_BUFFER_TIMESTAMP (buf)));
+             self->discont_sent = TRUE;
+             counter++;
+           }
+          GST_DEBUG_OBJECT (self, "Sent buffer with TS %" GST_TIME_FORMAT, GST_TIME_ARGS(GST_BUFFER_TIMESTAMP (buf)));
+
+          ret = gst_pad_push (self->srcpad, buf);
+        }
+
+        /* move this forward (the tmplayer parser needs this) */
+        if (self->state.duration != GST_CLOCK_TIME_NONE)
+          self->state.start_time += self->state.duration;
+
+        g_free (subtitle);
+        subtitle = NULL;
+      }
+    }
+
+    if (ret != GST_FLOW_OK) {
+      GST_DEBUG_OBJECT (self, "flow: %s", gst_flow_get_name (ret));
+      break;
+    }
+#else
     /* Now parse the line, out of segment lines will just return NULL */
     GST_LOG_OBJECT (self, "Parsing line '%s'", line + offset);
     subtitle = self->parse_line (&self->state, line + offset);
@@ -1556,6 +1833,7 @@ handle_buffer (GstSubParse * self, GstBuffer * buf)
         break;
       }
     }
+#endif
   }
 
   return ret;
@@ -1576,7 +1854,7 @@ gst_sub_parse_chain (GstPad * sinkpad, GstBuffer * buf)
 
     gst_pad_push_event (self->srcpad, gst_event_new_new_segment (FALSE,
             self->segment.rate, self->segment.format,
-            self->segment.last_stop, self->segment.stop, self->segment.time));
+            self->segment.start, self->segment.stop, self->segment.time));
     self->need_segment = FALSE;
   }
 
@@ -1625,7 +1903,7 @@ gst_sub_parse_sink_event (GstPad * pad, GstEvent * event)
           &stop, &time);
 
       GST_DEBUG_OBJECT (self, "newsegment (%s)", gst_format_get_name (format));
-
+      self->need_segment = TRUE;
       if (format == GST_FORMAT_TIME) {
         gst_segment_set_newsegment (&self->segment, update, rate, format,
             start, stop, time);

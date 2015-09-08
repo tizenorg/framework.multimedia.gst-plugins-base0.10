@@ -2,6 +2,7 @@
  * Copyright (C) <1999> Erik Walthinsen <omega@cse.ogi.edu>
  * This file:
  * Copyright (C) 2003 Ronald Bultje <rbultje@ronald.bitfreak.net>
+ * Copyright (C) 2012, 2013 Samsung Electronics Co., Ltd.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -17,6 +18,9 @@
  * License along with this library; if not, write to the
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 02111-1307, USA.
+ *
+ * * Modifications by Samsung Electronics Co., Ltd.
+ * 1. Support samsung extension format
  */
 
 /**
@@ -47,7 +51,7 @@ GST_DEBUG_CATEGORY (ffmpegcolorspace_performance);
 #define FFMPEGCSP_VIDEO_CAPS						\
   "video/x-raw-yuv, width = "GST_VIDEO_SIZE_RANGE" , "			\
   "height="GST_VIDEO_SIZE_RANGE",framerate="GST_VIDEO_FPS_RANGE","	\
-  "format= (fourcc) { I420 , NV12 , NV21 , YV12 , YUY2 , Y42B , Y444 , YUV9 , YVU9 , Y41B , Y800 , Y8 , GREY , Y16 , UYVY , YVYU , IYU1 , v308 , AYUV , A420 , SUYV , SYVY , S420 } ;" \
+  "format= (fourcc) { I420 , NV12 , NV21 , YV12 , YUY2 , Y42B , Y444 , YUV9 , YVU9 , Y41B , Y800 , Y8 , GREY , Y16 , UYVY , YVYU , IYU1 , v308 , AYUV , A420 , SUYV , SYVY , S420 , ITLV } ;" \
   GST_VIDEO_CAPS_RGB";"							\
   GST_VIDEO_CAPS_BGR";"							\
   GST_VIDEO_CAPS_RGBx";"						\

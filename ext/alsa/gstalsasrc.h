@@ -69,10 +69,15 @@ struct _GstAlsaSrc {
   guint                 period_time;
   snd_pcm_uframes_t     buffer_size;
   snd_pcm_uframes_t     period_size;
+  gboolean              is_live;
+  guint                 flush_src_id;
 
   GstAlsaMixer          *mixer;
 
   GMutex                *alsa_lock;
+  gboolean              handle_pause;
+  GCond                 *pause_cond;
+  GMutex                *pause_lock;
 };
 
 struct _GstAlsaSrcClass {

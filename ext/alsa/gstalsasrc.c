@@ -62,6 +62,7 @@ enum
   PROP_DEVICE,
   PROP_DEVICE_NAME,
   PROP_CARD_NAME,
+  PROP_IS_LIVE,
   PROP_LAST
 };
 
@@ -88,6 +89,7 @@ static gboolean gst_alsasrc_close (GstAudioSrc * asrc);
 static guint gst_alsasrc_read (GstAudioSrc * asrc, gpointer data, guint length);
 static guint gst_alsasrc_delay (GstAudioSrc * asrc);
 static void gst_alsasrc_reset (GstAudioSrc * asrc);
+static GstStateChangeReturn gst_alsasrc_change_state (GstElement * element, GstStateChange transition);
 
 /* AlsaSrc signals and args */
 enum
@@ -105,7 +107,13 @@ static GstStaticPadTemplate alsasrc_src_factory =
     GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("audio/x-raw-int, "
+    GST_STATIC_CAPS ("audio/x-lpcm, "
+        "endianness = (int) { 1234, 4321 }, "
+        "signed = (boolean) { TRUE, FALSE }, "
+        "width = (int) 16, "
+        "depth = (int) 16, "
+        "rate = (int) [ 1, MAX ], " "channels = (int) [ 1, 2 ];"
+        "audio/x-raw-int, "
         "endianness = (int) { " ALSA_SRC_FACTORY_ENDIANNESS " }, "
         "signed = (boolean) { TRUE, FALSE }, "
         "width = (int) 32, "
@@ -202,8 +210,10 @@ gst_alsasrc_class_init (GstAlsaSrcClass * klass)
   GObjectClass *gobject_class;
   GstBaseSrcClass *gstbasesrc_class;
   GstAudioSrcClass *gstaudiosrc_class;
+  GstElementClass *gstelement_class;
 
   gobject_class = (GObjectClass *) klass;
+  gstelement_class = (GstElementClass *) klass;
   gstbasesrc_class = (GstBaseSrcClass *) klass;
   gstaudiosrc_class = (GstAudioSrcClass *) klass;
 
@@ -220,6 +230,7 @@ gst_alsasrc_class_init (GstAlsaSrcClass * klass)
   gstaudiosrc_class->read = GST_DEBUG_FUNCPTR (gst_alsasrc_read);
   gstaudiosrc_class->delay = GST_DEBUG_FUNCPTR (gst_alsasrc_delay);
   gstaudiosrc_class->reset = GST_DEBUG_FUNCPTR (gst_alsasrc_reset);
+  gstelement_class->change_state = GST_DEBUG_FUNCPTR (gst_alsasrc_change_state);
 
   g_object_class_install_property (gobject_class, PROP_DEVICE,
       g_param_spec_string ("device", "Device",
@@ -235,6 +246,86 @@ gst_alsasrc_class_init (GstAlsaSrcClass * klass)
       g_param_spec_string ("card-name", "Card name",
           "Human-readable name of the sound card",
           DEFAULT_PROP_CARD_NAME, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_IS_LIVE,
+     g_param_spec_boolean ("is-live",
+     "is live session",
+     "is live session",
+     0, G_PARAM_READWRITE));
+}
+
+static gboolean timer_flush_data(GstAlsaSrc *src)
+{
+  if(src->handle_pause) {
+    gint32 frames = 0;
+    gint err;
+    frames = snd_pcm_avail(src->handle);
+    if(frames>0) {
+      GST_DEBUG("Frames avail for reading: %d", frames);
+      err = snd_pcm_forward(src->handle,frames);
+      if (err < 0)
+        GST_WARNING("Can't recovery from suspend, prepare failed: %s", snd_strerror (err));
+    }
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static GstStateChangeReturn
+gst_alsasrc_change_state (GstElement * element, GstStateChange transition)
+{
+  GstAlsaSrc *src = GST_ALSA_SRC (element);
+
+  GstStateChangeReturn result = GST_STATE_CHANGE_FAILURE;
+  switch (transition) {
+  case GST_STATE_CHANGE_NULL_TO_READY:
+    GST_INFO("GST_STATE_CHANGE_NULL_TO_READY");
+    break;
+  case GST_STATE_CHANGE_READY_TO_PAUSED:
+    GST_INFO("GST_STATE_CHANGE_READY_TO_PAUSED");
+    break;
+  case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+    GST_INFO("GST_STATE_CHANGE_PAUSED_TO_PLAYING");
+    if(src->is_live) {
+      GstAudioSrc * asrc = (GstAudioSrc*)src;
+      gint err;
+      GST_ALSA_SRC_LOCK (asrc);
+
+      gint32 frames = 0;
+      frames = snd_pcm_avail(src->handle);
+      if(frames>0) {
+        GST_DEBUG("Frames avail for reading: %d", frames);
+        err = snd_pcm_forward(src->handle,frames);
+        if (err < 0)
+          GST_WARNING("Can't recovery from suspend, prepare failed: %s", snd_strerror (err));
+      }
+      GST_ALSA_SRC_UNLOCK (asrc);
+      src->handle_pause = FALSE;
+      g_cond_signal(src->pause_cond);
+    }
+    break;
+  case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+    GST_INFO("GST_STATE_CHANGE_PLAYING_TO_PAUSED");
+    if(src->is_live) {
+      src->handle_pause = TRUE;
+      src->flush_src_id = g_timeout_add(100, timer_flush_data, src);
+    }
+    break;
+  case GST_STATE_CHANGE_PAUSED_TO_READY:
+    GST_INFO("GST_STATE_CHANGE_PAUSED_TO_READY");
+    if (src->is_live) {
+      if (src->flush_src_id > 0) g_source_remove(src->flush_src_id);
+      src->handle_pause = FALSE;
+    }
+    break;
+  case GST_STATE_CHANGE_READY_TO_NULL:
+    GST_INFO("GST_STATE_CHANGE_READY_TO_NULL");
+    break;
+  default :
+    break;
+  }
+  result = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+  return result;
 }
 
 static void
@@ -252,6 +343,10 @@ gst_alsasrc_set_property (GObject * object, guint prop_id,
       if (src->device == NULL) {
         src->device = g_strdup (DEFAULT_PROP_DEVICE);
       }
+      break;
+    case PROP_IS_LIVE:
+      src->is_live = g_value_get_boolean (value);
+      GST_DEBUG("is_live %d", src->is_live);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -281,6 +376,9 @@ gst_alsasrc_get_property (GObject * object, guint prop_id,
           gst_alsa_find_card_name (GST_OBJECT_CAST (src),
               src->device, SND_PCM_STREAM_CAPTURE));
       break;
+    case PROP_IS_LIVE:
+      g_value_set_boolean (value, src->is_live);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -296,6 +394,9 @@ gst_alsasrc_init (GstAlsaSrc * alsasrc, GstAlsaSrcClass * g_class)
   alsasrc->cached_caps = NULL;
 
   alsasrc->alsa_lock = g_mutex_new ();
+  alsasrc->pause_cond = g_cond_new ();
+  alsasrc->pause_lock = g_mutex_new ();
+  alsasrc->handle_pause = FALSE;
 }
 
 #define CHECK(call, error) \
@@ -745,6 +846,7 @@ xrun_recovery (GstAlsaSrc * alsa, snd_pcm_t * handle, gint err)
   GST_DEBUG_OBJECT (alsa, "xrun recovery %d", err);
 
   if (err == -EPIPE) {          /* under-run */
+    GST_DEBUG_OBJECT (alsa, "overrun case");
     err = snd_pcm_prepare (handle);
     if (err < 0)
       GST_WARNING_OBJECT (alsa,
@@ -779,6 +881,8 @@ gst_alsasrc_read (GstAudioSrc * asrc, gpointer data, guint length)
 
   cptr = length / alsa->bytes_per_sample;
   ptr = data;
+
+  if(alsa->is_live && alsa->handle_pause) g_cond_wait(alsa->pause_cond, alsa->pause_lock);
 
   GST_ALSA_SRC_LOCK (asrc);
   while (cptr > 0) {

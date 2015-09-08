@@ -877,6 +877,20 @@ gst_video_format_from_fourcc (guint32 fourcc)
       return GST_VIDEO_FORMAT_IYU1;
     case GST_MAKE_FOURCC ('A', 'Y', '6', '4'):
       return GST_VIDEO_FORMAT_AYUV64;
+#ifdef GST_EXT_XV_ENHANCEMENT
+    case GST_MAKE_FOURCC ('S', 'T', '1', '2'):
+      return GST_VIDEO_FORMAT_ST12;
+    case GST_MAKE_FOURCC ('S', 'N', '1', '2'):
+      return GST_VIDEO_FORMAT_SN12;
+    case GST_MAKE_FOURCC ('S', 'U', 'Y', 'V'):
+      return GST_VIDEO_FORMAT_SUYV;
+    case GST_MAKE_FOURCC ('S', 'U', 'Y', '2'):
+      return GST_VIDEO_FORMAT_SUY2;
+    case GST_MAKE_FOURCC ('S', '4', '2', '0'):
+      return GST_VIDEO_FORMAT_S420;
+    case GST_MAKE_FOURCC ('S', 'Y', 'V', 'Y'):
+      return GST_VIDEO_FORMAT_SYVY;
+#endif
     default:
       return GST_VIDEO_FORMAT_UNKNOWN;
   }
@@ -944,6 +958,20 @@ gst_video_format_to_fourcc (GstVideoFormat format)
       return GST_MAKE_FOURCC ('I', 'Y', 'U', '1');
     case GST_VIDEO_FORMAT_AYUV64:
       return GST_MAKE_FOURCC ('A', 'Y', '6', '4');
+#ifdef GST_EXT_XV_ENHANCEMENT
+    case GST_VIDEO_FORMAT_ST12:
+      return GST_MAKE_FOURCC ('S', 'T', '1', '2');
+    case GST_VIDEO_FORMAT_SN12:
+      return GST_MAKE_FOURCC ('S', 'N', '1', '2');
+    case GST_VIDEO_FORMAT_SUYV:
+      return GST_MAKE_FOURCC ('S', 'U', 'Y', 'V');
+    case GST_VIDEO_FORMAT_SUY2:
+      return GST_MAKE_FOURCC ('S', 'U', 'Y', '2');
+    case GST_VIDEO_FORMAT_S420:
+      return GST_MAKE_FOURCC ('S', '4', '2', '0');
+    case GST_VIDEO_FORMAT_SYVY:
+      return GST_MAKE_FOURCC ('S', 'Y', 'V', 'Y');
+#endif
     default:
       return 0;
   }

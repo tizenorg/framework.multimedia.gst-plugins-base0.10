@@ -1,3 +1,351 @@
+gst-plugins-base0.10 (0.10.36-74) unstable; urgency=low
+
+  * [xvimagesink] Check whether external display is connected or not when VisibilityNofify FALSE event is received
+  * Tag: gst-plugins-base0.10_0.10.36-74
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Sat, 01 Jun 2013 13:25:22 +0900
+
+gst-plugins-base0.10 (0.10.36-73) unstable; urgency=low
+
+  * [xvimagesink] Update window if window handle is changed and state is PAUSED
+  * Tag: gst-plugins-base0.10_0.10.36-73
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 30 May 2013 17:46:10 +0900
+
+gst-plugins-base0.10 (0.10.36-68) unstable; urgency=low
+
+  * [xvimagesink] Fix bug - skip putimage because of abnormal condition check code
+  * Tag: gst-plugins-base0.10_0.10.36-68
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Wed, 08 May 2013 13:35:56 +0900
+
+gst-plugins-base0.10 (0.10.36-66) unstable; urgency=low
+
+  * [cameracontrol] Add new field for embedded data
+  * Tag: gst-plugins-base0.10_0.10.36-66
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 18 Apr 2013 19:22:01 +0900
+
+gst-plugins-base0.10 (0.10.36-65) unstable; urgency=low
+
+  * [xvimagesink] Add new property for color space range
+  * Tag: gst-plugins-base0.10_0.10.36-65
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 18 Apr 2013 17:29:09 +0900
+
+gst-plugins-base0.10 (0.10.36-64) unstable; urgency=low
+
+  * [xvimagesink] Fix prevent issue
+  * Tag: gst-plugins-base0.10_0.10.36-64
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Mon, 15 Apr 2013 14:38:35 +0900
+
+gst-plugins-base0.10 (0.10.36-63) unstable; urgency=low
+
+  * [xvimagesink] Skip putimage when too many buffers are already put
+  * Tag: gst-plugins-base0.10_0.10.36-63
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Fri, 05 Apr 2013 20:17:24 +0900
+
+gst-plugins-base0.10 (0.10.36-62) unstable; urgency=low
+
+  * [xvimagesink] Init aligned size when change image size while playing
+  * Tag: gst-plugins-base0.10_0.10.36-62
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Fri, 05 Apr 2013 14:04:22 +0900
+
+gst-plugins-base0.10 (0.10.36-60) unstable; urgency=low
+
+  * [xvimagesink] Modify structure of SCMN_IMGB for compatibility
+  * Tag: gst-plugins-base0.10_0.10.36-60
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Fri, 22 Mar 2013 13:57:43 +0900
+
+gst-plugins-base0.10 (0.10.36-59) unstable; urgency=low
+
+  * [xvimagesink] Support new fourcc "SR32" and new buffer share method(TIZEN_BUFFER)
+  * Tag: gst-plugins-base0.10_0.10.36-59
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 21 Mar 2013 14:12:38 +0900
+
+gst-plugins-base0.10 (0.10.36-57) unstable; urgency=low
+
+  * [xvimagesink] Putimage with invalid gem name when receive duplicated buffer
+  * Tag: gst-plugins-base0.10_0.10.36-57
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 14 Feb 2013 09:54:06 +0900
+
+gst-plugins-base0.10 (0.10.36-56) unstable; urgency=low
+
+  * [xvimagesink] check if the xcontext was made when setting visible property
+  * Tag: gst-plugins-base0.10_0.10.36-56
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Tue, 12 Feb 2013 10:01:45 +0900
+
+gst-plugins-base0.10 (0.10.36-55) unstable; urgency=low
+
+  * [xvimagesink] Enahance buffer management when DMABUF mode
+  * Tag: gst-plugins-base0.10_0.10.36-55
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Mon, 04 Feb 2013 18:27:02 +0900
+
+gst-plugins-base0.10 (0.10.36-54) unstable; urgency=low
+
+  * [xvimagesink] Add log at state_change function
+  * Tag: gst-plugins-base0.10_0.10.36-54
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Tue, 29 Jan 2013 15:04:01 +0900
+
+gst-plugins-base0.10 (0.10.36-53) unstable; urgency=low
+
+  * [xvimagesink] Fix memory leak when error or non-visible case
+  * Tag: gst-plugins-base0.10_0.10.36-53
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 24 Jan 2013 21:34:01 +0900
+
+gst-plugins-base0.10 (0.10.36-52) unstable; urgency=low
+
+  * [xvimagesink] Wait displaying buffer when drm close
+  * Tag: gst-plugins-base0.10_0.10.36-52
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Wed, 23 Jan 2013 15:26:08 +0900
+
+gst-plugins-base0.10 (0.10.36-51) unstable; urgency=low
+
+  * Update boilerplate for license
+  * Tag: gst-plugins-base0.10_0.10.36-51
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Sat, 19 Jan 2013 11:23:18 +0900
+
+gst-plugins-base0.10 (0.10.36-49) unstable; urgency=low
+
+  * [xvimagesink] Added "frame-render-error" signal for error caught case when calling XvPutImage()
+  * Tag: gst-plugins-base0.10_0.10.36-49
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Fri, 18 Jan 2013 14:25:32 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+46) unstable; urgency=low
+
+  * [xvimagesink] 1. do not store buffer information at displaying_buffers when using pixmap callback  2. change display geometry method enum type ordering
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+46
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Tue, 02 Jan 2013 16:06:11 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+45) unstable; urgency=low
+
+  * [xvimagesink] Fix prevent issue
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+45
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Mon, 31 Dec 2012 11:13:02 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+42) unstable; urgency=low
+
+  * [xvimagesink] Fix prevent defects
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+42
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Sat, 22 Dec 2012 15:55:23 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+41) unstable; urgency=low
+
+  * Fix prevent issue
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+41
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Sat, 22 Dec 2012 14:29:44 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+38) unstable; urgency=low
+
+  * [xvimagesink] add ORIGIN_SIZE_OR_LETTER_BOX mode for geometry method type
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+38
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Sun, 09 Dec 2012 14:22:43 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+37) unstable; urgency=low
+
+  * [xvimagesink] fix bug - refer im_format in xvimage(not in xvimagesink handle) created by _buffer_alloc()
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+37
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Sat, 08 Dec 2012 19:14:17 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+36) unstable; urgency=low
+
+  * [xvimagesink] add defensive code not to unref finalized buffer
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+36
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 06 Dec 2012 20:07:48 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+35) unstable; urgency=low
+
+  * [xvimagesink] move g_mutex_lock(flow_lock) code caused of unlock many times
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+35
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Wed, 05 Dec 2012 13:54:11 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+33) unstable; urgency=low
+
+  * [xvimagesink] Improve buffer management when DMABUF mode
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+33
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Tue, 04 Dec 2012 15:26:38 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+31) unstable; urgency=low
+
+  * [xvimagesink] do drm_fini() when GST_STATE_CHANGE_PAUSED_TO_READY
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+31
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Wed, 28 Nov 2012 20:50:12 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+30) unstable; urgency=low
+
+  * [xvimagesink] add code for posting "prepare-xid" element message with video size and display size on the bus to give applications an opportunity to set xwindow or xpixmap
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+30
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Fri, 16 Nov 2012 13:36:23 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+29) unstable; urgency=low
+
+  * [xvimagesink] Support SN21 format
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+29
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Wed, 14 Nov 2012 21:02:56 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+28) unstable; urgency=low
+
+  * [xvimagesink] add flow_lock/unlock in _show_frame() preparing in the event of using _set_window_handle()
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+28
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Wed, 14 Nov 2012 10:34:56 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+27) unstable; urgency=low
+
+  * [typefind] Modify aac type find to select correctly
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+27
+
+ -- Sunghyun Eum <sunghyun.eum@samsung.com>  Wed, 07 Nov 2012 21:11:36 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+26) unstable; urgency=low
+
+  * [xvimagesink] fix bug - first incoming pixmap's drawing region was set 0 when using multiple pixmaps
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+26
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Wed, 07 Nov 2012 17:08:56 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+25) unstable; urgency=low
+
+  * [xvimagesink] Improve code for dmabuf mode - close gem handle after putimage
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+25
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Tue, 06 Nov 2012 18:06:19 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+22) unstable; urgency=low
+
+  * [xvimagesink] Add new property "flip"
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+22
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Mon, 29 Oct 2012 16:32:17 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+21) unstable; urgency=low
+
+  * [xvimagesink] support multiple pixmaps usage
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+21
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Fri, 26 Oct 2012 16:38:56 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+20) unstable; urgency=low
+
+  * [xvimagesink] fix resources leak in drm_init()
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+20
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Thu, 25 Oct 2012 15:48:53 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+19) unstable; urgency=low
+
+  * [xvimagesink] remove code for closing fd
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+19
+
+ -- Sangchul Lee <sc11.lee@samsung.com>  Thu, 25 Oct 2012 00:22:49 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+18) unstable; urgency=low
+
+  * [subparse] fix for suaparse to enable smi
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+18 
+
+ -- Yejin Cho <cho.yejin@samsung.com>  Mon, 22 Oct 2012 15:23:54 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+17) unstable; urgency=low
+
+  * [ffmpegcolorspace] Support ITLV(actucally UYVY) fourcc
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+17
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Fri, 12 Oct 2012 10:47:00 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+16) unstable; urgency=low
+
+  * [xvimagesink] Fix leak for DRM device open and close
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+16
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 11 Oct 2012 13:17:30 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+13) unstable; urgency=low
+
+  * [xvimagesink] Update code for checking window event
+  * Git: gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+13
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 27 Sep 2012 14:10:20 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+12) unstable; urgency=low
+
+  * [xvimagesink] Apply dmabuf feature
+  * Git: framework/multimedia/gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+12
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 20 Sep 2012 17:29:24 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+11) unstable; urgency=low
+
+  * Add manifest file
+  * Git: framework/multimedia/gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+11
+
+ -- Jeongmo Yang <jm80.yang@samsung.com>  Thu, 20 Sep 2012 14:29:27 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+10) unstable; urgency=low
+
+  * Add extended profile to support 3g2 file
+  * Git: framework/multimedia/gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+10
+
+ -- Sunghyun Eum <sunghyun.eum@samsung.com>  Wed, 19 Sep 2012 10:09:38 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+8) unstable; urgency=low
+
+  * Add specific fourcc to gst_video_format_parse_caps for proper checking
+  * Git: framework/multimedia/gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+8
+
+ -- Sunghyun Eum <sunghyun.eum@samsung.com>  Tue, 11 Sep 2012 09:10:29 +0900
+
+gst-plugins-base0.10 (0.10.36-1slp2+7) unstable; urgency=low
+
+  * Modified TCP data handling for WFD specific case
+  * Git: slp/pkgs/g/gst-plugins-base0.10
+  * Tag: gst-plugins-base0.10_0.10.36-1slp2+7
+
+ -- Santhoshi KS <santhoshi.ks@samsung.com>  Tue, 28 Aug 2012 19:46:30 +0900
+
 gst-plugins-base0.10 (0.10.36-1slp2+6) unstable; urgency=low
 
   * Destroy xim_transparenter image when destroying xwindow

@@ -81,6 +81,7 @@ G_STMT_START { \
  * @GST_RTSP_ETIMEOUT: a timeout occured
  * @GST_RTSP_ETGET: the tunnel GET request has been performed
  * @GST_RTSP_ETPOST: the tunnel POST request has been performed
+ * @GST_RTSP_ENOHDCPKEY: HDCP key was not installed
  * @GST_RTSP_ELAST: last error
  *
  * Result codes from the RTSP functions.
@@ -104,8 +105,8 @@ typedef enum {
   GST_RTSP_ETIMEOUT    = -14,
   GST_RTSP_ETGET       = -15,
   GST_RTSP_ETPOST      = -16,
-
-  GST_RTSP_ELAST       = -17
+  GST_RTSP_ENOHDCPKEY	= -17,
+  GST_RTSP_ELAST       = -18
 } GstRTSPResult;
 
 /**

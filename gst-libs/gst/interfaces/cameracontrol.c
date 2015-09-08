@@ -1,7 +1,7 @@
 /*
  * GStreamer Camera Control Interface
  *
- * Copyright (c) 2000 - 2012 Samsung Electronics Co., Ltd. All rights reserved.
+ * Copyright (c) 2000 - 2012 Samsung Electronics Co., Ltd.
  *
  * Contact: Jeongmo Yang <jm80.yang@samsung.com>
  *
@@ -132,8 +132,13 @@ static void gst_camera_control_class_init(GstCameraControlClass *klass)
 	klass->get_part_color = NULL;
 	klass->get_exif_info = NULL;
 	klass->set_capture_command = NULL;
+        klass->set_record_command = NULL;
 	klass->start_face_zoom = NULL;
 	klass->stop_face_zoom = NULL;
+	klass->set_ae_lock = NULL;
+	klass->get_ae_lock = NULL;
+	klass->set_awb_lock = NULL;
+	klass->get_awb_lock = NULL;
 }
 
 const GList* gst_camera_control_list_channels(GstCameraControl *control)
@@ -148,23 +153,23 @@ const GList* gst_camera_control_list_channels(GstCameraControl *control)
 }
 
 
-gboolean gst_camera_control_set_value(GstCameraControl *control, GstCameraControlChannel *control_channel)
+gboolean gst_camera_control_set_value(GstCameraControl *control, GstCameraControlChannel *control_channel, gint value)
 {
 	GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
 
 	if (klass->set_value) {
-		return klass->set_value(control, control_channel);
+		return klass->set_value(control, control_channel, value);
 	}
 
 	return FALSE;
 }
 
-gboolean gst_camera_control_get_value(GstCameraControl *control, GstCameraControlChannel *control_channel)
+gboolean gst_camera_control_get_value(GstCameraControl *control, GstCameraControlChannel *control_channel, gint *value)
 {
 	GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
 
 	if (klass->get_value) {
-		return klass->get_value(control, control_channel);
+		return klass->get_value(control, control_channel, value);
 	}
 
 	return FALSE;
@@ -493,6 +498,16 @@ void gst_camera_control_set_capture_command(GstCameraControl *control, GstCamera
 
 	return;
 }
+void gst_camera_control_set_record_command(GstCameraControl *control, GstCameraControlRecordCommand cmd)
+{
+        GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
+
+        if (klass->set_record_command) {
+                klass->set_record_command(control, cmd);
+        }
+
+        return;
+}
 
 gboolean gst_camera_control_start_face_zoom(GstCameraControl *control, gint x, gint y, gint zoom_level)
 {
@@ -511,6 +526,50 @@ gboolean gst_camera_control_stop_face_zoom(GstCameraControl *control)
 
 	if (klass->stop_face_zoom) {
 		return klass->stop_face_zoom(control);
+	}
+
+	return FALSE;
+}
+
+gboolean gst_camera_control_set_ae_lock(GstCameraControl *control, gboolean lock)
+{
+	GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
+
+	if (klass->set_ae_lock) {
+		return klass->set_ae_lock(control, lock);
+	}
+
+	return FALSE;
+}
+
+gboolean gst_camera_control_get_ae_lock(GstCameraControl *control, gboolean *lock)
+{
+	GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
+
+	if (klass->get_ae_lock) {
+		return klass->get_ae_lock(control, lock);
+	}
+
+	return FALSE;
+}
+
+gboolean gst_camera_control_set_awb_lock(GstCameraControl *control, gboolean lock)
+{
+	GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
+
+	if (klass->set_awb_lock) {
+		return klass->set_awb_lock(control, lock);
+	}
+
+	return FALSE;
+}
+
+gboolean gst_camera_control_get_awb_lock(GstCameraControl *control, gboolean *lock)
+{
+	GstCameraControlClass *klass = GST_CAMERA_CONTROL_GET_CLASS(control);
+
+	if (klass->get_awb_lock) {
+		return klass->get_awb_lock(control, lock);
 	}
 
 	return FALSE;

@@ -220,6 +220,9 @@ struct _GstAudioDecoderPrivate
   GstAdapter *adapter;
   /* tracking input ts for changes */
   GstClockTime prev_ts;
+#if 1
+  guint64 prev_distance;
+#endif
   /* frames obtained from input */
   GQueue frames;
   /* collected output data */
@@ -444,6 +447,9 @@ gst_audio_decoder_reset (GstAudioDecoder * dec, gboolean full)
   dec->priv->out_ts = GST_CLOCK_TIME_NONE;
   dec->priv->out_dur = 0;
   dec->priv->prev_ts = GST_CLOCK_TIME_NONE;
+#if 1
+  dec->priv->prev_distance = 0;
+#endif
   dec->priv->drained = TRUE;
   dec->priv->base_ts = GST_CLOCK_TIME_NONE;
   dec->priv->samples = 0;
@@ -976,6 +982,7 @@ gst_audio_decoder_push_buffers (GstAudioDecoder * dec, gboolean force)
     if (G_LIKELY (av)) {
       gint len;
       GstClockTime ts;
+      guint64 distance;
 
       /* parse if needed */
       if (klass->parse) {
@@ -1015,6 +1022,7 @@ gst_audio_decoder_push_buffers (GstAudioDecoder * dec, gboolean force)
         len = av;
       }
       /* track upstream ts, but do not get stuck if nothing new upstream */
+#if 0
       ts = gst_adapter_prev_timestamp (priv->adapter, NULL);
       if (ts == priv->prev_ts) {
         GST_LOG_OBJECT (dec, "ts == prev_ts; discarding");
@@ -1022,6 +1030,16 @@ gst_audio_decoder_push_buffers (GstAudioDecoder * dec, gboolean force)
       } else {
         priv->prev_ts = ts;
       }
+#else
+      ts = gst_adapter_prev_timestamp (priv->adapter, &distance);
+      if (ts != priv->prev_ts || distance <= priv->prev_distance) {
+        priv->prev_ts = ts;
+        priv->prev_distance = distance;
+      } else {
+        GST_LOG_OBJECT (dec, "ts == prev_ts; discarding");
+        ts = GST_CLOCK_TIME_NONE;
+      }
+#endif
       buffer = gst_adapter_take_buffer (priv->adapter, len);
       buffer = gst_buffer_make_metadata_writable (buffer);
       GST_BUFFER_TIMESTAMP (buffer) = ts;

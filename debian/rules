@@ -30,7 +30,8 @@ CONFIGURE_OPTION +=--prefix=/usr		\
 CFLAGS += -Wall -g -fPIC			\
 		-DGST_EXT_XV_ENHANCEMENT	\
 		-DGST_EXT_LINK_FIMCCONVERT	\
-		-DGST_EXT_MIME_TYPES
+		-DGST_EXT_MIME_TYPES		\
+		-DGST_EXT_ENABLE_SMI
 
 ifneq (,$(findstring noopt,$(DEB_BUILD_OPTIONS)))
 	CFLAGS += -O0

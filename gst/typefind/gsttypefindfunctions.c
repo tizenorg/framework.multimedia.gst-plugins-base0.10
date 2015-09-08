@@ -477,6 +477,67 @@ hls_type_find (GstTypeFind * tf, gpointer unused)
   }                                                                     \
 }
 
+#define XML_INC_BUFFER_DATA {                                           \
+  pos++;                                                                \
+  if (pos >= length) {                                                  \
+    return FALSE;                                                       \
+  } else {                                                              \
+    data++;                                                             \
+  }                                                                     \
+}
+
+static gboolean
+xml_check_first_element_from_data (const guint8 * data, guint length,
+    const gchar * element, guint elen, gboolean strict)
+{
+  gboolean got_xmldec;
+  guint pos = 0;
+
+  g_return_val_if_fail (data != NULL, FALSE);
+
+  if (length <= 5)
+    return FALSE;
+
+  /* look for the XMLDec
+   * see XML spec 2.8, Prolog and Document Type Declaration
+   * http://www.w3.org/TR/2004/REC-xml-20040204/#sec-prolog-dtd */
+  got_xmldec = (memcmp (data, "<?xml", 5) == 0);
+
+  if (strict && !got_xmldec)
+    return FALSE;
+
+  /* skip XMLDec in any case if we've got one */
+  if (got_xmldec) {
+    if (pos + 5 >= length)
+      return FALSE;
+    pos += 5;
+    data += 5;
+  }
+
+  /* look for the first element, it has to be the requested element. Bail
+   * out if it is not within the first 4kB. */
+  while (data && pos < MIN (4096, length)) {
+    while (*data != '<' && pos < MIN (4096, length)) {
+      XML_INC_BUFFER_DATA;
+    }
+
+    XML_INC_BUFFER_DATA;
+    if (!g_ascii_isalpha (*data)) {
+      /* if not alphabetic, it's a PI or an element / attribute declaration
+       * like <?xxx or <!xxx */
+      XML_INC_BUFFER_DATA;
+      continue;
+    }
+
+    /* the first normal element, check if it's the one asked for */
+    if (pos + elen + 1 >= length)
+      return FALSE;
+    return (data && element && strncmp ((char *) data, element, elen) == 0);
+  }
+
+  return FALSE;
+}
+
 static gboolean
 xml_check_first_element (GstTypeFind * tf, const gchar * element, guint elen,
     gboolean strict)
@@ -583,6 +644,71 @@ smil_type_find (GstTypeFind * tf, gpointer unused)
     gst_type_find_suggest (tf, GST_TYPE_FIND_MAXIMUM, SMIL_CAPS);
   }
 }
+
+#ifdef GST_EXT_SS_TYPE
+/*** application/x-ss [Microsoft's Smooth Streaming]***********************************/
+
+static GstStaticCaps ss_caps = GST_STATIC_CAPS ("application/x-ss");
+
+#define SS_CAPS (gst_static_caps_get(&ss_caps))
+static void
+ss_type_find (GstTypeFind * tf, gpointer unused)
+{
+
+  if (xml_check_first_element (tf, "SmoothStreamingMedia", 20, TRUE)) {
+	  gst_type_find_suggest (tf, GST_TYPE_FIND_MAXIMUM, SS_CAPS);
+	} else {
+	  const guint8 *data;
+	  gboolean utf16_le, utf16_be;
+	  const gchar *convert_from = NULL;
+	  guint8 *converted_data;
+
+	  /* try detecting the charset */
+	  data = gst_type_find_peek (tf, 0, 2);
+
+	  if (data == NULL)
+		return;
+
+	  /* look for a possible BOM */
+	  utf16_le = data[0] == 0xFF && data[1] == 0xFE;
+	  utf16_be = data[0] == 0xFE && data[1] == 0xFF;
+	  if (utf16_le) {
+		convert_from = "UTF-16LE";
+	  } else if (utf16_be) {
+		convert_from = "UTF-16BE";
+	  }
+
+	  if (convert_from) {
+		gsize new_size = 0;
+		guint length = gst_type_find_get_length (tf);
+
+		/* try a default that should be enough */
+		if (length == 0)
+		  length = 512;
+		data = gst_type_find_peek (tf, 0, length);
+
+		if (data) {
+		  /* skip the BOM */
+		  data += 2;
+		  length -= 2;
+
+		  converted_data =
+			  (guint8 *) g_convert ((gchar *) data, length, "UTF-8", convert_from,
+			  NULL, &new_size, NULL);
+		  if (converted_data) {
+			if (xml_check_first_element_from_data (converted_data, new_size,
+					"SmoothStreamingMedia", 20, TRUE))
+			  gst_type_find_suggest (tf, GST_TYPE_FIND_MAXIMUM,
+				  SS_CAPS);
+
+			g_free (converted_data);
+		  }
+		}
+	  }
+	}
+
+}
+#endif
 
 /*** text/html ***/
 
@@ -980,6 +1106,45 @@ aac_type_find (GstTypeFind * tf, gpointer unused)
         }
 
         gst_type_find_suggest (tf, GST_TYPE_FIND_LIKELY, caps);
+#ifdef GST_EXT_TYPEFIND_ENHANCEMENT
+        /* find more aac sync to select correctly */
+
+        /* check if there's a third ADTS frame */
+        len = ((c.data[3] & 0x03) << 11) | (c.data[4] << 3) | ((c.data[5] & 0xe0) >> 5);
+        if (len == 0 || !data_scan_ctx_ensure_data (tf, &c, len + 2)) {
+          GST_DEBUG ("Wrong sync or next frame not within reach, len=%u", len);
+          goto next;
+        }
+        snc = GST_READ_UINT16_BE (c.data + len);
+        if ((snc & 0xfff6) == 0xfff0) {
+          gst_type_find_suggest (tf, GST_TYPE_FIND_LIKELY + 5, caps); /* 85% */
+          GST_DEBUG ("Find 3rd Sync..probability is %u ", GST_TYPE_FIND_LIKELY + 5);
+        }
+
+        /* check if there's a fourth ADTS frame */
+        len = ((c.data[3] & 0x03) << 11) | (c.data[4] << 3) | ((c.data[5] & 0xe0) >> 5);
+        if (len == 0 || !data_scan_ctx_ensure_data (tf, &c, len + 2)) {
+          GST_DEBUG ("Wrong sync or next frame not within reach, len=%u", len);
+          goto next;
+        }
+        snc = GST_READ_UINT16_BE (c.data + len);
+        if ((snc & 0xfff6) == 0xfff0) {
+          gst_type_find_suggest (tf, GST_TYPE_FIND_LIKELY + 10, caps); /* 90% */
+          GST_DEBUG ("Find 4th Sync..probability is %u ", GST_TYPE_FIND_LIKELY + 10);
+        }
+
+        /* check if there's a fifth(last) ADTS frame */
+        len = ((c.data[3] & 0x03) << 11) | (c.data[4] << 3) | ((c.data[5] & 0xe0) >> 5);
+        if (len == 0 || !data_scan_ctx_ensure_data (tf, &c, len + 2)) {
+          GST_DEBUG ("Wrong sync or next frame not within reach, len=%u", len);
+          goto next;
+        }
+        snc = GST_READ_UINT16_BE (c.data + len);
+        if ((snc & 0xfff6) == 0xfff0) {
+          gst_type_find_suggest (tf, GST_TYPE_FIND_NEARLY_CERTAIN, caps); /* 99% */
+          GST_DEBUG ("Find 5th Sync..probability is %u ", GST_TYPE_FIND_NEARLY_CERTAIN);
+        }
+#endif
         gst_caps_unref (caps);
         break;
       }
@@ -1831,7 +1996,7 @@ static GstStaticCaps multipart_caps =
 GST_STATIC_CAPS ("multipart/x-mixed-replace");
 #define MULTIPART_CAPS gst_static_caps_get(&multipart_caps)
 
-/* multipart/x-mixed replace is: 
+/* multipart/x-mixed replace is:
  *   <maybe some whitespace>--<some ascii chars>[\r]\n
  *   <more ascii chars>[\r]\nContent-type:<more ascii>[\r]\n */
 static void
@@ -1888,7 +2053,7 @@ static GstStaticCaps mpeg_sys_caps = GST_STATIC_CAPS ("video/mpeg, "
 #define IS_MPEG_PES_HEADER(data)        (IS_MPEG_HEADER (data) &&            \
                                          IS_MPEG_PES_CODE (((guint8 *)(data))[3]))
 
-#define MPEG2_MAX_PROBE_LENGTH (128 * 1024)     /* 128kB should be 64 packs of the 
+#define MPEG2_MAX_PROBE_LENGTH (128 * 1024)     /* 128kB should be 64 packs of the
                                                  * most common 2kB pack size. */
 
 #define MPEG2_MIN_SYS_HEADERS 2
@@ -2103,7 +2268,7 @@ mpeg_sys_type_find (GstTypeFind * tf, gpointer unused)
   }
 
   /* If we at least saw MIN headers, and *some* were pes headers (pack headers
-   * are optional in an mpeg system stream) then return a lower-probability 
+   * are optional in an mpeg system stream) then return a lower-probability
    * result */
   if (pes_headers > 0 && (pack_headers + pes_headers) > MPEG2_MIN_SYS_HEADERS)
     goto suggest;
@@ -2179,7 +2344,7 @@ mpeg_ts_probe_headers (GstTypeFind * tf, guint64 offset, gint packet_size)
 static void
 mpeg_ts_type_find (GstTypeFind * tf, gpointer unused)
 {
-  /* TS packet sizes to test: normal, DVHS packet size and 
+  /* TS packet sizes to test: normal, DVHS packet size and
    * FEC with 16 or 20 byte codes packet size. */
   const gint pack_sizes[] = { 188, 192, 204, 208 };
   const guint8 *data = NULL;
@@ -2208,7 +2373,7 @@ mpeg_ts_type_find (GstTypeFind * tf, gpointer unused)
         if (found >= GST_MPEGTS_TYPEFIND_MIN_HEADERS) {
           gint probability;
 
-          /* found at least 4 headers. 10 headers = MAXIMUM probability. 
+          /* found at least 4 headers. 10 headers = MAXIMUM probability.
            * Arbitrarily, I assigned 10% probability for each header we
            * found, 40% -> 100% */
           probability = MIN (10 * found, GST_TYPE_FIND_MAXIMUM);
@@ -2443,7 +2608,7 @@ h264_video_type_find (GstTypeFind * tf, gpointer unused)
 {
   DataScanCtx c = { 0, NULL, 0 };
 
-  /* Stream consists of: a series of sync codes (00 00 00 01) followed 
+  /* Stream consists of: a series of sync codes (00 00 00 01) followed
    * by NALs
    */
   int nut, ref;
@@ -2708,6 +2873,14 @@ q3gp_type_find_get_profile (const guint8 * data)
       return "general";
     case GST_MAKE_FOURCC ('3', 'g', 'p', 0):
       return "basic";
+#ifdef GST_EXT_MIME_TYPES /* add extended keyword for differentiating */
+    case GST_MAKE_FOURCC ('3', 'g', '2', 0):
+      return "extended";
+    case GST_MAKE_FOURCC ('i', 's', 'm', 0): {
+      g_print ("fragment file format...\n\n");
+      return "fragmented";
+    }
+#endif
     case GST_MAKE_FOURCC ('3', 'g', 's', 0):
       return "streaming-server";
     case GST_MAKE_FOURCC ('3', 'g', 'r', 0):
@@ -2715,6 +2888,14 @@ q3gp_type_find_get_profile (const guint8 * data)
     default:
       break;
   }
+
+#ifdef GST_EXT_MIME_TYPES
+  if (GST_MAKE_FOURCC (data[0], data[1], data[2], data[3]) == GST_MAKE_FOURCC ('p', 'i', 'f', 'f')) {
+    g_print ("piff fragmented...\n\n");
+    return "fragmented";
+  }
+#endif
+
   return NULL;
 }
 
@@ -2821,7 +3002,8 @@ qt_type_find (GstTypeFind * tf, gpointer unused)
 
     if (STRNCMP (&data[4], "ftypisom", 8) == 0 ||
         STRNCMP (&data[4], "ftypavc1", 8) == 0 ||
-        STRNCMP (&data[4], "ftypmp42", 8) == 0) {
+        STRNCMP (&data[4], "ftypmp42", 8) == 0 ||
+        STRNCMP (&data[4], "ftypwmf ", 8) == 0) {
       tip = GST_TYPE_FIND_MAXIMUM;
       variant = "iso";
       break;
@@ -2841,9 +3023,8 @@ qt_type_find (GstTypeFind * tf, gpointer unused)
       }
     }
     /* other box/atom types, apparently quicktime specific */
-    else if (STRNCMP (&data[4], "pnot", 4) == 0 ||
-        STRNCMP (&data[4], "PICT", 4) == 0 ||
-        STRNCMP (&data[4], "wide", 4) == 0 ||
+    else if (STRNCMP (&data[4], "PICT", 4) == 0 ||
+	STRNCMP (&data[4], "wide", 4) == 0 ||
         STRNCMP (&data[4], "prfl", 4) == 0) {
       tip = GST_TYPE_FIND_MAXIMUM;
       break;
@@ -2863,7 +3044,8 @@ qt_type_find (GstTypeFind * tf, gpointer unused)
         if (STRNCMP (&data[4], "isom", 4) == 0 ||
             STRNCMP (&data[4], "avc1", 4) == 0 ||
             STRNCMP (&data[4], "mp41", 4) == 0 ||
-            STRNCMP (&data[4], "mp42", 4) == 0) {
+            STRNCMP (&data[4], "mp42", 4) == 0 ||
+            STRNCMP (&data[4], "wmf ", 4) == 0) {
           tip = GST_TYPE_FIND_MAXIMUM;
           variant = "iso";
           goto done;
@@ -4476,6 +4658,9 @@ plugin_init (GstPlugin * plugin)
   static const gchar *ape_exts[] = { "ape", NULL };
   static const gchar *uri_exts[] = { "ram", NULL };
   static const gchar *hls_exts[] = { "m3u8", NULL };
+#ifdef GST_EXT_SS_TYPE
+  static const gchar *ss_exts[] = { "manifest", NULL };
+#endif
   static const gchar *sdp_exts[] = { "sdp", NULL };
   static const gchar *smil_exts[] = { "smil", NULL };
   static const gchar *html_exts[] = { "htm", "html", NULL };
@@ -4503,7 +4688,7 @@ plugin_init (GstPlugin * plugin)
   static const gchar *zip_exts[] = { "zip", NULL };
   static const gchar *compress_exts[] = { "Z", NULL };
   static const gchar *m4a_exts[] = { "m4a", NULL };
-  static const gchar *q3gp_exts[] = { "3gp", NULL };
+  static const gchar *q3gp_exts[] = { "3gp", "ismv", "isma", NULL };
   static const gchar *aac_exts[] = { "aac", "adts", "adif", "loas", NULL };
   static const gchar *spc_exts[] = { "spc", NULL };
   static const gchar *wavpack_exts[] = { "wv", "wvp", NULL };
@@ -4563,12 +4748,13 @@ plugin_init (GstPlugin * plugin)
 #ifndef GST_EXT_MIME_TYPES
   TYPE_FIND_REGISTER_RIFF (plugin, "audio/qcelp", GST_RANK_PRIMARY,
       qcp_exts, "QLCM");
-  TYPE_FIND_REGISTER_RIFF (plugin, "video/x-cdxa", GST_RANK_PRIMARY,
-      cdxa_exts, "CDXA");
   TYPE_FIND_REGISTER_START_WITH (plugin, "video/x-vcd", GST_RANK_PRIMARY,
       cdxa_exts, "\000\377\377\377\377\377\377\377\377\377\377\000", 12,
       GST_TYPE_FIND_MAXIMUM);
 #endif
+  TYPE_FIND_REGISTER_RIFF (plugin, "video/x-cdxa", GST_RANK_PRIMARY,
+      cdxa_exts, "CDXA");
+
   TYPE_FIND_REGISTER_START_WITH (plugin, "audio/x-imelody", GST_RANK_PRIMARY,
       imelody_exts, "BEGIN:IMELODY", 13, GST_TYPE_FIND_MAXIMUM);
 #if 0
@@ -4612,9 +4798,9 @@ plugin_init (GstPlugin * plugin)
 #ifndef GST_EXT_MIME_TYPES
   TYPE_FIND_REGISTER (plugin, "audio/x-gsm", GST_RANK_PRIMARY, NULL, gsm_exts,
       GSM_CAPS, NULL, NULL);
+#endif
   TYPE_FIND_REGISTER (plugin, "video/mpeg-sys", GST_RANK_PRIMARY,
       mpeg_sys_type_find, mpeg_sys_exts, MPEG_SYS_CAPS, NULL, NULL);
-#endif
   TYPE_FIND_REGISTER (plugin, "video/mpegts", GST_RANK_PRIMARY,
       mpeg_ts_type_find, mpeg_ts_exts, MPEGTS_CAPS, NULL, NULL);
   TYPE_FIND_REGISTER (plugin, "application/ogg", GST_RANK_PRIMARY,
@@ -4672,12 +4858,16 @@ plugin_init (GstPlugin * plugin)
       hls_type_find, hls_exts, HLS_CAPS, NULL, NULL);
   TYPE_FIND_REGISTER (plugin, "application/sdp", GST_RANK_SECONDARY,
       sdp_type_find, sdp_exts, SDP_CAPS, NULL, NULL);
+#ifdef GST_EXT_SS_TYPE
+  TYPE_FIND_REGISTER (plugin, "application/x-ss", GST_RANK_PRIMARY,
+      ss_type_find, ss_exts, SS_CAPS, NULL, NULL);
+#endif
 #ifndef GST_EXT_MIME_TYPES
   TYPE_FIND_REGISTER (plugin, "application/smil", GST_RANK_SECONDARY,
       smil_type_find, smil_exts, SMIL_CAPS, NULL, NULL);
   TYPE_FIND_REGISTER (plugin, "application/xml", GST_RANK_MARGINAL,
       xml_type_find, xml_exts, GENERIC_XML_CAPS, NULL, NULL);
-#endif  
+#endif
   TYPE_FIND_REGISTER_RIFF (plugin, "audio/x-wav", GST_RANK_PRIMARY, wav_exts,
       "WAVE");
 #ifndef GST_EXT_MIME_TYPES
@@ -4701,7 +4891,7 @@ plugin_init (GstPlugin * plugin)
       shn_type_find, shn_exts, SHN_CAPS, NULL, NULL);
   TYPE_FIND_REGISTER (plugin, "application/x-ape", GST_RANK_SECONDARY,
       ape_type_find, ape_exts, APE_CAPS, NULL, NULL);
-#endif  
+#endif
   TYPE_FIND_REGISTER (plugin, "image/jpeg", GST_RANK_PRIMARY + 15,
       jpeg_type_find, jpeg_exts, JPEG_CAPS, NULL, NULL);
   TYPE_FIND_REGISTER_START_WITH (plugin, "image/gif", GST_RANK_PRIMARY,

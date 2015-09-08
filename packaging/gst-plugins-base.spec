@@ -1,12 +1,13 @@
 Name:       gst-plugins-base
 Summary:    GStreamer streaming media framework base plug-ins
-Version:    0.10.36
-Release:    7
+Version:    0.10.37
+Release:    171
 Group:      Applications/Multimedia
-License:    LGPLv2+
+License:    LGPL-2.0+
 Source0:    %{name}-%{version}.tar.gz
 #Patch0:     Samsung-feature-bugs.patch
 Requires(post): /sbin/ldconfig
+Requires(post): /usr/bin/vconftool
 Requires(postun): /sbin/ldconfig
 BuildRequires:  pkgconfig(ogg)
 BuildRequires:  pkgconfig(theora)
@@ -17,8 +18,15 @@ BuildRequires:  pkgconfig(alsa)
 BuildRequires:  pkgconfig(gstreamer-0.10)
 BuildRequires:  pkgconfig(gstreamer-base-0.10)
 BuildRequires:  pkgconfig(xv)
-BuildRequires:  pkgconfig(pango)
+BuildRequires:  pkgconfig(xfixes)
+BuildRequires:  pkgconfig(dri2proto)
+BuildRequires:  pkgconfig(libdri2)
+BuildRequires:  pkgconfig(libtbm)
+BuildRequires:  pkgconfig(libdrm)
+BuildRequires:  pkgconfig(utilX)
 BuildRequires:  intltool
+#BuildRequires: libsavscodec-neon-devel
+BuildRequires: pkgconfig(vconf)
 
 
 %description
@@ -54,10 +62,18 @@ Separate sub-package contaning helper applications of gstreamer base plugins.
 %build
 %autogen --noconfigure
 
+#Add -DSAMSUNG_WFD_SPEC to enable RTP over TCP streaming support
 export CFLAGS+=" -Wall -g -fPIC\
  -DGST_EXT_XV_ENHANCEMENT\
+ -DSAMSUNG_WFD_SPEC\
+ -DGST_EXT_SS_TYPE\
  -DGST_EXT_LINK_FIMCCONVERT\
- -DGST_EXT_MIME_TYPES"
+ -DGST_EXT_MIME_TYPES\
+ -DGST_EXT_ENABLE_SMI\
+ -DGST_EXT_TYPEFIND_ENHANCEMENT\
+ -DGST_EXT_TIME_ANALYSIS\
+ -DGST_EXT_DECODEBIN2_QUEUESIZE\
+ -DGST_EXT_DECODEBIN2_MODIFICATION"
 
 %configure --prefix=/usr\
  --disable-static\
@@ -75,7 +91,8 @@ export CFLAGS+=" -Wall -g -fPIC\
  --disable-gcov\
  --disable-gtk-doc\
  --disable-debug\
- --with-audioresample-format=int
+ --with-audioresample-format=int\
+ --disable-gst_v4l
 
 make %{?jobs:-j%jobs}
 
@@ -86,12 +103,15 @@ rm -rf %{buildroot}
 
 rm -rf %{buildroot}/tmp/dump
 
-%post -p /sbin/ldconfig
+%post
+/sbin/ldconfig
 
+/usr/bin/vconftool set -t int memory/Player/XvStateInfo 0 -g 29 -f -i -s system::vconf_multimedia
 %postun -p /sbin/ldconfig
 
 
 %files
+%manifest gst-plugins-base.manifest
 %defattr(-,root,root,-)
 #%doc COPYING 
 # libraries
@@ -123,7 +143,6 @@ rm -rf %{buildroot}/tmp/dump
 %{_libdir}/gstreamer-0.10/libgstvideorate.so
 %{_libdir}/gstreamer-0.10/libgstvideoscale.so
 %{_libdir}/gstreamer-0.10/libgsttcp.so
-%{_libdir}/gstreamer-0.10/libgstvideo4linux.so
 %{_libdir}/gstreamer-0.10/libgstaudioresample.so
 %{_libdir}/gstreamer-0.10/libgstapp.so
 %{_libdir}/gstreamer-0.10/libgstxvimagesink.so
@@ -134,7 +153,6 @@ rm -rf %{buildroot}/tmp/dump
 %{_libdir}/gstreamer-0.10/libgsttheora.so
 %{_libdir}/gstreamer-0.10/libgstvorbis.so
 %{_libdir}/gstreamer-0.10/libgstximagesink.so
-%{_libdir}/gstreamer-0.10/libgstpango.so
 %{_libdir}/gstreamer-0.10/libgstgio.so
 # data
 %{_datadir}/gst-plugins-base/license-translations.dict
@@ -250,6 +268,7 @@ rm -rf %{buildroot}/tmp/dump
 %{_libdir}/pkgconfig/*.pc
 
 %files tools
+%manifest gst-plugins-base-tools.manifest
 %defattr(-,root,root,-)
 # helper programs
 %{_bindir}/gst-discoverer-0.10

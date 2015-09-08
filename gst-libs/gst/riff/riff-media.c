@@ -60,7 +60,7 @@ gst_riff_create_video_caps (guint32 codec_fcc,
 
   switch (codec_fcc) {
     case GST_MAKE_FOURCC ('D', 'I', 'B', ' '): /* uncompressed RGB */
-    case GST_MAKE_FOURCC (0x00, 0x00, 0x00, 0x00):
+    //case GST_MAKE_FOURCC (0x00, 0x00, 0x00, 0x00):   /*Commented so that FOURCC 0000 doesn't get detected as RGB format. ALso no standard for FOURCC 0000 */
     case GST_MAKE_FOURCC ('R', 'G', 'B', ' '):
     case GST_MAKE_FOURCC ('R', 'A', 'W', ' '):
     {
@@ -1396,7 +1396,12 @@ gst_riff_create_audio_caps (guint16 codec_id,
     {
       gint version = (codec_id - GST_RIFF_WAVE_FORMAT_WMAV1) + 1;
 
-      channels_max = 6;
+      /*Since gstreamer already knows GST_RIFF_WAVE_FORMAT_WMAV3_L (WMA lossless media) as version 3.*/
+      if(codec_id == GST_RIFF_WAVE_FORMAT_WMAV3_L)
+        version = (codec_id - GST_RIFF_WAVE_FORMAT_WMAV1);
+
+      /* WMA Pro supports upto 8 channels */
+      channels_max = 8;
       block_align = TRUE;
 
       caps = gst_caps_new_simple ("audio/x-wma",

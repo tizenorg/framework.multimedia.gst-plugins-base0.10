@@ -1,5 +1,6 @@
 /* GStreamer
  * Copyright (C) <2005> Julien Moutte <julien@moutte.net>
+ * Copyright (C) 2012, 2013 Samsung Electronics Co., Ltd.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -15,6 +16,11 @@
  * License along with this library; if not, write to the
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 02111-1307, USA.
+ *
+ * * Modifications by Samsung Electronics Co., Ltd.
+ * 1. Add display related properties
+ * 2. Support samsung extension format to improve performance
+ * 3. Support video texture overlay of OSP layer
  */
 
 #ifndef __GST_XVIMAGESINK_H__
@@ -40,6 +46,9 @@
 #ifdef GST_EXT_XV_ENHANCEMENT
 #include <X11/Xatom.h>
 #include <stdio.h>
+#include "xv_types.h"
+#include <utilX.h>
+#include <utilX_ext.h>
 #endif
 
 #include <string.h>
@@ -60,8 +69,15 @@ G_BEGIN_DECLS
   (G_TYPE_CHECK_CLASS_TYPE((klass), GST_TYPE_XVIMAGESINK))
 
 #ifdef GST_EXT_XV_ENHANCEMENT
-#define XV_SCREEN_SIZE_WIDTH 4096
-#define XV_SCREEN_SIZE_HEIGHT 4096
+#define XV_SCREEN_SIZE_WIDTH            4096
+#define XV_SCREEN_SIZE_HEIGHT           4096
+#define DISPLAYING_BUFFERS_MAX_NUM      10
+
+#define MAX_PIXMAP_NUM 10
+typedef uint (*get_pixmap_callback)(void *user_data);
+typedef struct _GstXPixmap GstXPixmap;
+typedef struct _GstXvImageDisplayingBuffer GstXvImageDisplayingBuffer;
+typedef struct _GstXvImageFlushBuffer GstXvImageFlushBuffer;
 #endif /* GST_EXT_XV_ENHANCEMENT */
 
 typedef struct _GstXContext GstXContext;
@@ -162,6 +178,29 @@ struct _GstXWindow {
   GC gc;
 };
 
+#ifdef GST_EXT_XV_ENHANCEMENT
+struct _GstXPixmap {
+	Window pixmap;
+	gint x, y;
+	gint width, height;
+	GC gc;
+};
+
+struct _GstXvImageDisplayingBuffer {
+	GstBuffer *buffer;
+	unsigned int dmabuf_fd[XV_BUF_PLANE_NUM];
+	unsigned int gem_name[XV_BUF_PLANE_NUM];
+	unsigned int gem_handle[XV_BUF_PLANE_NUM];
+	void *bo[XV_BUF_PLANE_NUM];
+	unsigned int ref_count;
+};
+
+struct _GstXvImageFlushBuffer {
+	unsigned int gem_name[XV_BUF_PLANE_NUM];
+	void *bo[XV_BUF_PLANE_NUM];
+};
+#endif
+
 /**
  * GstXvImageFormat:
  * @format: the image format
@@ -199,7 +238,14 @@ struct _GstXvImageBuffer {
 
   gint width, height, im_format;
   size_t size;
+#ifdef GST_EXT_XV_ENHANCEMENT
+  GstBuffer *current_buffer;
+#endif /* GST_EXT_XV_ENHANCEMENT */
 };
+
+#ifdef GST_EXT_XV_ENHANCEMENT
+#define MAX_PLANE_NUM          4
+#endif /* GST_EXT_XV_ENHANCEMENT */
 
 /**
  * GstXvImageSink:
@@ -248,6 +294,10 @@ struct _GstXvImageSink {
   GstXWindow *xwindow;
   GstXvImageBuffer *xvimage;
   GstXvImageBuffer *cur_image;
+#ifdef GST_EXT_XV_ENHANCEMENT
+  GstXvImageBuffer *last_image;
+  unsigned int last_image_vaddr[4];
+#endif
 
   GThread *event_thread;
   gboolean running;
@@ -288,14 +338,14 @@ struct _GstXvImageSink {
   /* port attributes */
   gboolean autopaint_colorkey;
   gint colorkey;
-  
+
   gboolean draw_borders;
-  
+
   /* port features */
   gboolean have_autopaint_colorkey;
   gboolean have_colorkey;
   gboolean have_double_buffer;
-  
+
   /* stream metadata */
   gchar *media_title;
 
@@ -305,23 +355,94 @@ struct _GstXvImageSink {
 
 #ifdef GST_EXT_XV_ENHANCEMENT
   /* display mode */
+  gboolean is_pixmap;
+  gboolean xid_updated;
   guint display_mode;
+  guint csc_range;
   guint display_geometry_method;
+  guint flip;
   guint rotate_angle;
-  gboolean rotate_changed;
   gboolean visible;
-  guint zoom;
+  gfloat zoom;
+  guint zoom_pos_x;
+  guint zoom_pos_y;
   guint rotation;
   guint rotate_cnt;
+  guint orientation;
+  guint dst_roi_mode;
   GstVideoRectangle dst_roi;
   XImage* xim_transparenter;
   guint scr_w, scr_h;
   gboolean stop_video;
   gboolean is_hided;
+  gboolean is_quick_panel_on;
+  gboolean is_multi_window;
+  gboolean is_during_seek;
+  GstVideoRectangle src_crop;
+
   /* needed if fourcc is one if S series */
   guint aligned_width;
   guint aligned_height;
+  gint drm_fd;
+  void *bufmgr;
+
+  /* for using multiple pixmaps */
+  GstXPixmap *xpixmap[MAX_PIXMAP_NUM];
+  gint current_pixmap_idx;
+  get_pixmap_callback get_pixmap_cb;
+  void* get_pixmap_cb_user_data;
+
+  /* for sync displaying buffers */
+  GstXvImageDisplayingBuffer displaying_buffers[DISPLAYING_BUFFERS_MAX_NUM];
+  GMutex *display_buffer_lock;
+
+  /* buffer count check */
+  guint displayed_buffer_count;
+  guint displaying_buffer_count;
+
+  /* zero copy format */
+  gboolean is_zero_copy_format;
+
+  /* secure contents path */
+  gint secure_path;
+
+  /* DRM level */
+  gint drm_level;
+
+#ifdef GST_EXT_ENABLE_HEVC
+  /* if needed combine planes data */
+  gint need_combine_data;
 #endif
+
+  /* display request time */
+  struct timeval request_time[DISPLAYING_BUFFERS_MAX_NUM];
+
+  /* last added buffer index */
+  gint last_added_buffer_index;
+
+  /* flush buffer */
+  GstXvImageFlushBuffer *flush_buffer;
+  gboolean enable_flush_buffer;
+
+  /* subtitle format */
+  Pixmap pixmap_for_subpicture;
+  gboolean is_subpicture_format;
+  gboolean set_overlay_for_subpicture_just_once;
+  gboolean subpicture;
+  gboolean is_hided_subpicture;
+  gboolean is_quick_panel_on_subpicture;
+  gboolean is_multi_window_subpicture;
+
+  /* external display */
+  gint external_width;
+  gint external_height;
+  gboolean skip_frame_due_to_external_dev;
+  gboolean keep_external_fullscreen_post;
+  gboolean keep_external_fullscreen_prev;
+
+  gboolean eos_received;
+
+#endif /* GST_EXT_XV_ENHANCEMENT */
 };
 
 #ifdef GST_EXT_XV_ENHANCEMENT

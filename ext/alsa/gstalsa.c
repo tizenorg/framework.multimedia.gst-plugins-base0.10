@@ -121,8 +121,11 @@ gst_alsa_detect_formats (GstObject * obj, snd_pcm_hw_params_t * hw_params,
 
     s = gst_caps_get_structure (in_caps, i);
     if (!gst_structure_has_name (s, "audio/x-raw-int")) {
-      GST_WARNING_OBJECT (obj, "skipping non-int format");
-      continue;
+      GST_WARNING_OBJECT (obj, "checking for LPCM format");
+      if(!gst_structure_has_name (s, "audio/x-lpcm")) {
+        GST_WARNING_OBJECT (obj, "skipping non-int format");
+        continue;
+      }
     }
     if (!gst_structure_get_int (s, "width", &width) ||
         !gst_structure_get_int (s, "depth", &depth))

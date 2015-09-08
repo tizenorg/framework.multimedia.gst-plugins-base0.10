@@ -234,6 +234,7 @@ static gboolean gst_app_src_query (GstBaseSrc * src, GstQuery * query);
 
 static GstFlowReturn gst_app_src_push_buffer_action (GstAppSrc * appsrc,
     GstBuffer * buffer);
+static gboolean gst_app_src_send_event (GstElement * element, GstEvent * event);
 
 static guint gst_app_src_signals[LAST_SIGNAL] = { 0 };
 
@@ -272,12 +273,14 @@ gst_app_src_class_init (GstAppSrcClass * klass)
 {
   GObjectClass *gobject_class = (GObjectClass *) klass;
   GstBaseSrcClass *basesrc_class = (GstBaseSrcClass *) klass;
+  GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);;
 
   gobject_class->dispose = gst_app_src_dispose;
   gobject_class->finalize = gst_app_src_finalize;
 
   gobject_class->set_property = gst_app_src_set_property;
   gobject_class->get_property = gst_app_src_get_property;
+  gstelement_class->send_event = GST_DEBUG_FUNCPTR (gst_app_src_send_event);
 
   /**
    * GstAppSrc::caps
@@ -1635,6 +1638,47 @@ gst_app_src_set_callbacks (GstAppSrc * appsrc,
   priv->user_data = user_data;
   priv->notify = notify;
   GST_OBJECT_UNLOCK (appsrc);
+}
+
+static gboolean
+gst_app_src_send_event (GstElement * element, GstEvent * event)
+{
+  GstAppSrc *appsrc;
+  gboolean result = FALSE;
+  GstBaseSrc *src;
+
+  src = GST_BASE_SRC (element);
+  appsrc = GST_APP_SRC (element);
+  GstAppSrcPrivate *priv = appsrc->priv;
+
+  GST_DEBUG_OBJECT (appsrc, "handling event %p %" GST_PTR_FORMAT, event, event);
+
+  switch (GST_EVENT_TYPE (event)) {
+      /* bidirectional events */
+    case GST_EVENT_FLUSH_STOP:
+      g_mutex_lock (priv->mutex);
+      GST_INFO_OBJECT (appsrc, "flushing internal queue");
+      gst_app_src_flush_queued (appsrc);
+      priv->flushing = FALSE;
+      g_mutex_unlock (priv->mutex);
+      result = gst_pad_push_event (src ->srcpad, event);
+      break;
+      /* fallback */
+    case GST_EVENT_FLUSH_START:
+      g_mutex_lock (priv->mutex);
+      priv->flushing = TRUE;
+      g_mutex_unlock (priv->mutex);
+      result = gst_pad_push_event (src ->srcpad, event);
+      break;
+    case GST_EVENT_NEWSEGMENT:
+      result = gst_pad_push_event (src ->srcpad, event);
+      break;
+    default:
+      result = GST_ELEMENT_CLASS (parent_class)->send_event (element, event);
+      break;
+  }
+
+  return result;
 }
 
 /*** GSTURIHANDLER INTERFACE *************************************************/

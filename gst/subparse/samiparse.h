@@ -13,8 +13,8 @@
  *
  * You should have received a copy of the GNU Library General Public
  * License along with this library; if not, write to the
- * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
- * Boston, MA 02111-1307, USA.
+ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+ * Boston, MA 02110-1301, USA.
  */
 
 #ifndef _SAMI_PARSE_H_
@@ -31,6 +31,12 @@ void    sami_context_init   (ParserState * state);
 void    sami_context_deinit (ParserState * state);
 
 void    sami_context_reset  (ParserState * state);
+#ifdef SUBPARSE_MODIFICATION
+void    sami_context_change_language  (ParserState * state);
+gboolean sami_validate_langlist_body(GList * lang_list, GstSubParse * self);
+gchar * sami_convert_to_utf8 (const gchar * str, gsize len, const gchar * encoding,
+    gsize * consumed, GError ** err, GstSubParse * self);
+#endif
 
 G_END_DECLS
 

@@ -1276,7 +1276,7 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
   GstBin *bin;
   GstPad *pad;
   GstElement *head = NULL, *prev = NULL, *elem = NULL;
-  GstPlugin *p;
+  GstPlugin *p = NULL;
 
   chain = g_new0 (GstPlayVideoChain, 1);
   chain->chain.playsink = playsink;
@@ -1336,6 +1336,7 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
   gst_object_ref_sink (bin);
   gst_bin_add (bin, chain->sink);
 
+#ifndef GST_EXT_XV_ENHANCEMENT
   /* decouple decoder from sink, this improves playback quite a lot since the
    * decoder can continue while the sink blocks for synchronisation. We don't
    * need a lot of buffers as this consumes a lot of memory and we don't want
@@ -1354,6 +1355,7 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
     gst_bin_add (bin, chain->queue);
     head = prev = chain->queue;
   }
+#endif
 
   if (!(playsink->flags & GST_PLAY_FLAG_NATIVE_VIDEO)) {
     GST_DEBUG_OBJECT (playsink, "creating videoconverter");

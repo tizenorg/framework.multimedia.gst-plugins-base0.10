@@ -119,6 +119,13 @@ GST_BOILERPLATE_FULL (GstAudioConvert, gst_audio_convert, GstBaseTransform,
 
 #define STATIC_CAPS \
 GST_STATIC_CAPS ( \
+  "audio/x-lpcm, " \
+    "rate = (int) [ 1, MAX ], " \
+    "channels = (int) [ 1, 2 ], " \
+    "endianness = (int) { LITTLE_ENDIAN, BIG_ENDIAN }, " \
+    "width = (int) [1,32], " \
+    "depth = (int) [ 1, 32 ], " \
+    "signed = (boolean) { true, false }; " \
   "audio/x-raw-float, " \
     "rate = (int) [ 1, MAX ], " \
     "channels = (int) [ 1, MAX ], " \
@@ -306,7 +313,8 @@ gst_audio_convert_parse_caps (const GstCaps * caps, AudioConvertFmt * fmt)
 
   fmt->endianness = G_BYTE_ORDER;
   fmt->is_int =
-      (strcmp (gst_structure_get_name (structure), "audio/x-raw-int") == 0);
+      (strcmp (gst_structure_get_name (structure), "audio/x-raw-int") == 0) ||
+      (strcmp (gst_structure_get_name (structure), "audio/x-lpcm") == 0);
 
   /* parse common fields */
   if (!gst_structure_get_int (structure, "channels", &fmt->channels))

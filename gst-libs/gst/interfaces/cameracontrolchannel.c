@@ -1,5 +1,8 @@
 /* GStreamer Camera Control Channel Interface
- * Copyright (C) 2003 Ronald Bultje <rbultje@ronald.bitfreak.net>
+ *
+ * Copyright (c) 2000 - 2012 Samsung Electronics Co., Ltd.
+ *
+ * Contact: Jeongmo Yang <jm80.yang@samsung.com>
  *
  * cameracontrolchannel.c: cameracontrol channel object design
  *

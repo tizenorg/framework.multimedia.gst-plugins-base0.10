@@ -608,14 +608,38 @@ gst_video_rate_flush_prev (GstVideoRate * videorate, gboolean duplicate)
   GstFlowReturn res;
   GstBuffer *outbuf;
   GstClockTime push_ts;
-
+#ifdef VIDEORATE_MODIFICATION
+  GstStructure *structure;
+  guint32 format;
+  GstCaps *buf_caps;
+#endif
   if (!videorate->prevbuf)
     goto eos_before_buffers;
 
   /* make sure we can write to the metadata */
-  outbuf = gst_buffer_make_metadata_writable
-      (gst_buffer_ref (videorate->prevbuf));
-
+#ifdef VIDEORATE_MODIFICATION
+  buf_caps = gst_buffer_get_caps (videorate->prevbuf);
+  if(!buf_caps) {
+    GST_ERROR("not able to get the caps");
+    return GST_FLOW_ERROR;
+  }
+  structure = gst_caps_get_structure (buf_caps, 0);
+  if(!structure) {
+    GST_ERROR("not able to get the structure");
+    return GST_FLOW_ERROR;
+  }
+  if (!gst_structure_get_fourcc (structure, "format", &format)) {
+    GST_ERROR ("can not get format in gst structure");
+  }
+  if(format== GST_MAKE_FOURCC('S', 'T', '1', '2') || format== GST_MAKE_FOURCC('S', 'N', '1', '2')) {
+    GST_ERROR("setting the format_transcode as TRUE");
+    outbuf=videorate->prevbuf;
+    gst_caps_unref(buf_caps);
+  } else {
+    outbuf = gst_buffer_make_metadata_writable
+    (gst_buffer_ref (videorate->prevbuf));
+  }
+#endif
   GST_BUFFER_OFFSET (outbuf) = videorate->out;
   GST_BUFFER_OFFSET_END (outbuf) = videorate->out + 1;
 
